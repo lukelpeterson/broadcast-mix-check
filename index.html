@@ -102,6 +102,7 @@
       <div class="hint">WAV, AIFF, FLAC, MP3, M4A or M4V (the browser must be able to decode the audio)</div>
     </div>
     <input id="file" type="file" accept="audio/*,video/*,.wav,.aif,.aiff,.flac,.mp3,.m4a,.m4v,.mp4,.mov" hidden>
+    <audio id="audio" preload="metadata" hidden></audio>
     <div id="engineBadge"></div>
     <div id="fileName" class="hint"></div>
     <div id="progress" class="hidden"></div>
@@ -131,7 +132,7 @@
 /* ---------- Background worker: loads Python and runs the check, so the page stays responsive ---------- */
 function workerMain() {
   const PYODIDE_VERSION = "0.26.4";
-  const BUILD = "2026-11-07-8";   // bump with each release so browsers fetch fresh engine files
+  const BUILD = "2026-11-07-9";   // bump with each release so browsers fetch fresh engine files
   const PY_FILES = [
     "py/browser_entry.py",
     "py/automix/__init__.py", "py/automix/check.py", "py/automix/sections.py", "py/automix/reference_profiles.yaml",
@@ -307,25 +308,19 @@ function parseTime(text) {
 }
 
 /* ---------- Waveform ---------- */
-function computePeaks(buffer, buckets = 1200) {
-  const left = buffer.getChannelData(0);
-  const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
-  const total = left.length, per = total / buckets;
-  const out = new Float32Array(buckets);
-  let max = 0;
-  for (let b = 0; b < buckets; b++) {
-    const from = Math.floor(b * per), to = Math.floor((b + 1) * per);
-    let m = 0;
-    for (let i = from; i < to; i += 4) {          // every 4th sample is plenty for a picture
-      const v = Math.abs(left[i]);
-      if (v > m) m = v;
-      if (right) { const u = Math.abs(right[i]); if (u > m) m = u; }
-    }
-    out[b] = m;
-    if (m > max) max = m;
+function addPeaks(peaks, frameStart, left, right, totalFrames) {
+  const n = peaks.length;
+  for (let i = 0; i < left.length; i += 4) {   // every 4th sample is plenty for a picture
+    const b = Math.min(n - 1, Math.floor(((frameStart + i) / totalFrames) * n));
+    const v = Math.max(Math.abs(left[i]), Math.abs(right[i]));
+    if (v > peaks[b]) peaks[b] = v;
   }
-  if (max > 0) for (let b = 0; b < buckets; b++) out[b] /= max;
-  return out;
+}
+
+function normalizePeaks(peaks) {
+  let max = 0;
+  for (const v of peaks) if (v > max) max = v;
+  if (max > 0) for (let b = 0; b < peaks.length; b++) peaks[b] /= max;
 }
 
 function cssVar(name) {
@@ -381,7 +376,7 @@ function drawWave() {
   g.fillText("0:00", 6, h - 6);
   g.textAlign = "right";
   g.fillText(mmss(total), w - 6, h - 6);
-  if (currentBuffer) {
+  if (currentFile) {
     const x = (position() / total) * w;
     g.fillStyle = cssVar("--ink");
     g.fillRect(x - 1, 0, 2, h);
@@ -590,149 +585,239 @@ function applyReport(report, first) {
 }
 
 /* ---------- Playback ---------- */
-let currentBuffer = null;     // the decoded audio, kept once measuring has finished
-let audioCtx = null, source = null, playing = false;
-let playOffset = 0, playStartedAt = 0;
-let frameId = null;
+// The browser's audio player streams the file from disk, so the recording is never held in memory.
+const audioEl = $("audio");
+let currentFile = null, objectUrl = null, playUntil = null, frameId = null;
 
-function duration() { return currentBuffer ? currentBuffer.duration : totalSeconds; }
-function position() {
-  if (!playing || !audioCtx) return playOffset;
-  return Math.min(duration(), playOffset + (audioCtx.currentTime - playStartedAt));
-}
+audioEl.addEventListener("ended", () => { playUntil = null; animate(); });
+audioEl.addEventListener("pause", () => animate());
+audioEl.addEventListener("play", () => animate());
+audioEl.addEventListener("seeked", () => animate());
+
+function duration() { return totalSeconds; }
+function position() { return currentFile ? audioEl.currentTime : 0; }
 
 function updateControls() {
-  $("playBtn").textContent = playing ? "❚❚ Pause" : "▶ Play";
+  $("playBtn").textContent = audioEl.paused ? "▶ Play" : "❚❚ Pause";
   $("clock").textContent = `${mmss(position())} / ${mmss(duration())}`;
 }
 
-function stopSource() {
-  if (source) { const s = source; source = null; try { s.stop(); } catch (err) { /* already stopped */ } }
-}
-
 function animate() {
-  cancelAnimationFrame(frameId);
+  if (frameId) cancelAnimationFrame(frameId);
+  frameId = null;
   const tick = () => {
+    if (playUntil !== null && audioEl.currentTime >= playUntil) { audioEl.pause(); playUntil = null; }
     drawWave();
     updateControls();
-    frameId = playing ? requestAnimationFrame(tick) : null;
+    frameId = audioEl.paused ? null : requestAnimationFrame(tick);
   };
   tick();
 }
 
 // Plays from a time, stopping at "until" if given (used for a single section).
 function play(from, until = null) {
-  if (!currentBuffer) return;
-  stopSource();
-  if (!audioCtx) audioCtx = new AudioContext({ sampleRate: 48000 });
-  if (audioCtx.state === "suspended") audioCtx.resume();
-  const src = audioCtx.createBufferSource();
-  src.buffer = currentBuffer;
-  src.connect(audioCtx.destination);
-  src.onended = () => {
-    if (source !== src) return;            // stopped on purpose, not at the end
-    source = null; playing = false; playOffset = 0;
-    animate();
-  };
-  const start = Math.max(0, Math.min(from, duration()));
-  if (until !== null) src.start(0, start, Math.max(0.05, until - start));
-  else src.start(0, start);
-  source = src;
-  playing = true;
-  playOffset = start;
-  playStartedAt = audioCtx.currentTime;
+  if (!currentFile) return;
+  playUntil = until;
+  audioEl.currentTime = Math.max(0, Math.min(from, duration()));
+  audioEl.play().catch(() => {});
   animate();
 }
 
 function pause() {
-  if (!playing) return;
-  playOffset = position();
-  playing = false;
-  stopSource();
+  audioEl.pause();
+  playUntil = null;
   animate();
 }
 
 function stopPlayback() {
-  stopSource();
-  playing = false;
-  playOffset = 0;
+  audioEl.pause();
+  playUntil = null;
   if (frameId) cancelAnimationFrame(frameId);
   frameId = null;
 }
 
 function seekTo(t) {
-  if (!currentBuffer) return;
-  if (playing) play(t);
-  else { playOffset = Math.max(0, Math.min(t, duration())); animate(); }
+  if (!currentFile) return;
+  playUntil = null;
+  audioEl.currentTime = Math.max(0, Math.min(t, duration()));
+  animate();
 }
 
 $("playBtn").addEventListener("click", () => {
-  if (!currentBuffer) return;
-  if (playing) pause();
-  else play(playOffset >= duration() - 0.05 ? 0 : playOffset);
+  if (!currentFile) return;
+  if (!audioEl.paused) pause();
+  else play(audioEl.currentTime >= duration() - 0.05 ? 0 : audioEl.currentTime);
 });
 
 /* ---------- Run ---------- */
-async function measure({ buffer, sampleRate, seconds }) {
+const PIECE_S = 30;      // the engine is fed this many seconds at a time
+const BUCKETS = 1200;    // waveform resolution
+
+// Reads a WAV header from the first 64 KB. Returns null for anything this reader does not handle.
+async function parseWav(file) {
+  const head = new DataView(await file.slice(0, 1 << 16).arrayBuffer());
+  const text = (o, n) => String.fromCharCode(...new Uint8Array(head.buffer, o, n));
+  if (head.byteLength < 12 || text(0, 4) !== "RIFF" || text(8, 4) !== "WAVE") return null;
+  let off = 12, fmt = null, dataOffset = -1, dataLen = 0;
+  while (off + 8 <= head.byteLength) {
+    const id = text(off, 4), size = head.getUint32(off + 4, true);
+    if (id === "fmt " && off + 8 + 16 <= head.byteLength) {
+      let format = head.getUint16(off + 8, true);
+      if (format === 0xFFFE && size >= 40) format = head.getUint16(off + 32, true);  // extensible: real format is inside
+      fmt = {
+        format,
+        channels: head.getUint16(off + 10, true),
+        sampleRate: head.getUint32(off + 12, true),
+        blockAlign: head.getUint16(off + 20, true),
+        bits: head.getUint16(off + 22, true),
+      };
+    } else if (id === "data") {
+      dataOffset = off + 8;
+      dataLen = size;
+      break;
+    }
+    off += 8 + size + (size & 1);
+  }
+  if (!fmt || dataOffset < 0) return null;
+  const supported = (fmt.format === 1 && [16, 24, 32].includes(fmt.bits)) || (fmt.format === 3 && fmt.bits === 32);
+  if (!supported || fmt.channels < 1 || fmt.sampleRate % 10 !== 0) return null;
+  const blockAlign = fmt.channels * (fmt.bits / 8);
+  // Some recorders write a size of 0 or too big for streamed files: use the rest of the file.
+  const available = file.size - dataOffset;
+  if (!dataLen || dataLen > available) dataLen = available;
+  return {
+    format: fmt.format, bits: fmt.bits, channels: fmt.channels, sampleRate: fmt.sampleRate,
+    blockAlign, dataOffset, frames: Math.floor(dataLen / blockAlign),
+  };
+}
+
+function readSample(view, o, info) {
+  if (info.format === 3) return view.getFloat32(o, true);
+  if (info.bits === 16) return view.getInt16(o, true) / 32768;
+  if (info.bits === 24) {
+    let v = view.getUint8(o) | (view.getUint8(o + 1) << 8) | (view.getUint8(o + 2) << 16);
+    if (v & 0x800000) v -= 0x1000000;
+    return v / 8388608;
+  }
+  return view.getInt32(o, true) / 2147483648;
+}
+
+// Reads one piece of the WAV file, starting at a frame, as two float channels.
+async function readWavPiece(file, info, startFrame, count) {
+  const from = info.dataOffset + startFrame * info.blockAlign;
+  const view = new DataView(await file.slice(from, from + count * info.blockAlign).arrayBuffer());
+  const left = new Float32Array(count), right = new Float32Array(count);
+  const bytes = info.bits / 8;
+  for (let n = 0; n < count; n++) {
+    const base = n * info.blockAlign;
+    left[n] = readSample(view, base, info);
+    right[n] = info.channels > 1 ? readSample(view, base + bytes, info) : left[n];
+  }
+  return { left, right };
+}
+
+function wavSource(file, info) {
+  return {
+    sampleRate: info.sampleRate,
+    frames: info.frames,
+    seconds: info.frames / info.sampleRate,
+    read: (start, count) => readWavPiece(file, info, start, count),
+  };
+}
+
+// Used for compressed formats: the whole file is decoded, so these are limited by size.
+function decodedSource(buffer) {
   const left = buffer.getChannelData(0);
-  const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
-  const total = left.length;
-  const piece = sampleRate * 30;
+  const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
+  return {
+    sampleRate: buffer.sampleRate,
+    frames: buffer.length,
+    seconds: buffer.duration,
+    read: async (start, count) => ({
+      left: left.slice(start, start + count),
+      right: right ? right.slice(start, start + count) : left.slice(start, start + count),
+    }),
+  };
+}
+
+function addPeaksFor(frameStart, left, right, frames) {
+  addPeaks(peaks, frameStart, left, right, frames);
+}
+
+async function measure(src) {
+  const { sampleRate, frames, seconds } = src;
+  const pieceFrames = sampleRate * PIECE_S;
+  totalSeconds = seconds;
+  peaks = new Float32Array(BUCKETS);
   setStep("measure", "active", `Measuring the audio: 0:00 of ${mmss(seconds)} (0%)`);
   await ask({ type: "start", baseUrl: BASE_URL, sampleRate });
-  for (let i = 0; i < total; i += piece) {
-    const l = left.slice(i, i + piece).buffer;
-    const r = right.slice(i, i + piece).buffer;
-    await ask({ type: "chunk", left: l, right: r }, [l, r]);
-    const done = Math.min(i + piece, total);
-    const pct = Math.round((100 * done) / total);
-    const text = done < total
+  for (let f = 0; f < frames; f += pieceFrames) {
+    const count = Math.min(pieceFrames, frames - f);
+    const { left, right } = await src.read(f, count);
+    addPeaksFor(f, left, right, frames);
+    await ask({ type: "chunk", left: left.buffer, right: right.buffer }, [left.buffer, right.buffer]);
+    const done = f + count;
+    const pct = Math.round((100 * done) / frames);
+    setStep("measure", "active", done < frames
       ? `Measuring the audio: ${mmss(done / sampleRate)} of ${mmss(seconds)} (${pct}%)`
-      : `Measured all ${mmss(seconds)} of audio`;
-    setStep("measure", "active", text);
+      : `Measured all ${mmss(seconds)} of audio`);
   }
   setStep("measure", "active", "Finding sections and writing notes");
   const reply = await ask({ type: "finish" });
   if (ticker) { clearInterval(ticker); ticker = null; }
   setStep("measure", "done", "Finished");
-  setStep("read", "done", `${mmss(seconds)} of audio read`);
   // The waveform and editor appear only once measuring has finished.
-  peaks = computePeaks(buffer);
-  currentBuffer = buffer;
+  normalizePeaks(peaks);
   $("results").classList.remove("hidden");
   applyReport(reply.result.report, true);
   setBusy("Drag a boundary or edit the times to re-measure.");
 }
+
+// Compressed files are decoded whole, so they are refused above this size.
+const MAX_DECODED_BYTES = 300 * 1048576;
 
 async function analyze(file) {
   $("errorBox").classList.remove("show");
   $("results").classList.add("hidden");
   for (const s of STEPS) if (s.id !== "engine") delete state[s.id];
   stopPlayback();
-  currentBuffer = null;
+  currentFile = null;
   model = null;
   peaks = null;
   userNotes.clear();
-  currentFileName = file.name;
   const sizeMb = (file.size / 1048576).toFixed(1);
   setStep("received", "done", `${file.name} · ${sizeMb} MB`);
   $("fileName").textContent = "";
   if (!(state.engine && state.engine.status === "done")) {
-    // Start loading Python now, in parallel with decoding. The engine step shows its progress.
+    // Start loading Python now, in parallel with reading the file. The engine step shows its progress.
     worker.postMessage({ type: "warm", baseUrl: BASE_URL });
     setStep("engine", "active", "Loading the analysis engine (about 20 seconds the first time)");
   }
-  setStep("read", "active", "Decoding the audio");
-  let decoded;
+  setStep("read", "active", "Reading the file");
+  let src;
   try {
-    decoded = await decodeToStereo(file);
+    const wav = await parseWav(file);
+    if (wav) {
+      src = wavSource(file, wav);
+      setStep("read", "done", `${mmss(src.seconds)} of audio ready (read in pieces, not loaded whole)`);
+    } else {
+      if (file.size > MAX_DECODED_BYTES) {
+        return fail("This compressed file is too large to open on this device. Export it as WAV, or use a computer.");
+      }
+      setStep("read", "active", "Decoding the audio");
+      const decoded = await decodeToStereo(file);
+      src = decodedSource(decoded.buffer);
+      setStep("read", "done", `${mmss(decoded.seconds)} of audio read`);
+    }
   } catch (err) {
-    return fail(`The browser could not decode this file (${err.message || err}).`);
+    return fail(`The browser could not read this file (${err.message || err}).`);
   }
-  totalSeconds = decoded.seconds;
-  setStep("read", "done", `${mmss(decoded.seconds)} of audio read`);
+  currentFile = file;
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = URL.createObjectURL(file);
+  audioEl.src = objectUrl;
   try {
-    await measure(decoded);
+    await measure(src);
   } catch (err) {
     fail(err.message || String(err));
   }
