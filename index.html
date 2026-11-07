@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broadcast Mix Check (test)</title>
+<style>
+  :root { --bg:#f7f6f3; --card:#fff; --ink:#1d1d1b; --muted:#6b6a66; --line:#e2e0da; --accent:#2f5d8a; --ok:#2e7d4f; --warn:#a4551c; --bad:#b3261e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:880px; margin:0 auto; padding:28px 18px 60px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  h2 { font-size:17px; margin:0 0 10px; }
+  .lede { color:var(--muted); margin:0 0 18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:16px; }
+  .drop { border:2px dashed var(--line); border-radius:10px; padding:26px; text-align:center; cursor:pointer; }
+  .drop.over { border-color:var(--accent); }
+  .drop strong { color:var(--accent); }
+  .hint { font-size:13px; color:var(--muted); margin-top:8px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+  .note { border-left:4px solid var(--accent); background:var(--bg); padding:9px 12px; margin:9px 0; border-radius:0 8px 8px 0; font-size:14px; }
+  .note .where { font-weight:600; color:var(--muted); font-size:13px; }
+  .note .console { margin-top:4px; }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  .placeholder { background:rgba(164,85,28,.08); border:1px solid rgba(164,85,28,.35); color:var(--warn); border-radius:8px; padding:9px 12px; font-size:14px; margin-bottom:14px; }
+  .hidden { display:none; }
+
+  /* progress */
+  #progress { margin-top:14px; }
+  .step { display:flex; gap:10px; align-items:flex-start; padding:6px 0; font-size:15px; }
+  .icon { width:20px; text-align:center; font-weight:700; flex:none; }
+  .step.pending { color:var(--muted); }
+  .step.active .icon { color:var(--accent); }
+  .step.done .icon { color:var(--ok); }
+  .step.error { color:var(--bad); font-weight:600; }
+  .step.error .icon { color:var(--bad); }
+  .step .detail { display:block; font-size:13px; font-weight:400; color:var(--muted); }
+  .spin { display:inline-block; animation:spin 1s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #errorBox { display:none; margin-top:12px; background:rgba(179,38,30,.07); border:1px solid rgba(179,38,30,.4); color:var(--bad); border-radius:8px; padding:10px 12px; font-size:14px; white-space:pre-wrap; }
+  #errorBox.show { display:block; }
+  #engineBadge { font-size:13px; color:var(--muted); margin-top:4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Broadcast Mix Check</h1>
+  <p class="lede">Drop in a Sunday recording and get the sections, measurements and notes for next week. The file is read in your browser and never uploaded.</p>
+
+  <div class="placeholder">Test version. Targets are placeholders until Matt's annotated recordings set them. Start with a short clip; a very long file may run out of memory in the browser.</div>
+
+  <section class="card">
+    <h2>1. Recording</h2>
+    <div id="drop" class="drop">
+      <div><strong>Choose a file</strong> or drop one here</div>
+      <div class="hint">WAV, AIFF, FLAC, MP3, M4A or M4V (the browser must be able to decode the audio)</div>
+    </div>
+    <input id="file" type="file" accept="audio/*,video/*,.wav,.aif,.aiff,.flac,.mp3,.m4a,.m4v,.mp4,.mov" hidden>
+    <div id="engineBadge"></div>
+    <div id="fileName" class="hint"></div>
+    <div id="progress" class="hidden"></div>
+    <div id="errorBox"></div>
+  </section>
+
+  <section id="results" class="card hidden">
+    <h2>Sections</h2>
+    <table>
+      <thead><tr><th>Section</th><th>Type</th><th>Source</th><th>Time</th><th>LUFS</th><th>Peak dBTP</th></tr></thead>
+      <tbody id="sections"></tbody>
+    </table>
+    <h2 style="margin-top:18px">Notes for next Sunday</h2>
+    <div id="notes"></div>
+    <div style="margin-top:14px"><button id="copy" class="primary">Copy report (Markdown)</button> <span id="copied" class="hint"></span></div>
+  </section>
+</main>
+
+<script type="module">
+/* ---------- Background worker: loads Python and runs the check, so the page stays responsive ---------- */
+function workerMain() {
+  const PYODIDE_VERSION = "0.26.4";
+  const PY_FILES = [
+    "py/browser_entry.py",
+    "py/automix/__init__.py", "py/automix/check.py", "py/automix/sections.py", "py/automix/reference_profiles.yaml",
+    "py/pyloudnorm/__init__.py", "py/pyloudnorm/iirfilter.py", "py/pyloudnorm/meter.py",
+    "py/pyloudnorm/normalize.py", "py/pyloudnorm/util.py",
+  ];
+  let enginePromise = null;
+  const say = (id, text) => postMessage({ type: "step", id, text });
+
+  function loadEngine(baseUrl) {
+    if (!enginePromise) {
+      enginePromise = (async () => {
+        say("engine", "Loading the analysis engine (about 20 seconds the first time)");
+        importScripts(`https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/pyodide.js`);
+        const py = await loadPyodide({ indexURL: `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/` });
+        await py.loadPackage(["numpy", "scipy", "pyyaml"]);
+        py.FS.mkdirTree("/home/pyodide/automix");
+        py.FS.mkdirTree("/home/pyodide/pyloudnorm");
+        for (const path of PY_FILES) {
+          const text = await (await fetch(new URL(path, baseUrl))).text();
+          py.FS.writeFile("/home/pyodide/" + path.replace(/^py\//, ""), text);
+        }
+        py.runPython("import sys; sys.path.insert(0, '/home/pyodide')");
+        postMessage({ type: "stepDone", id: "engine" });
+        return py;
+      })();
+    }
+    return enginePromise;
+  }
+
+  self.onmessage = async (e) => {
+    const msg = e.data;
+    try {
+      const py = await loadEngine(msg.baseUrl);
+      if (msg.type === "warm") return;
+      say("measure", "Measuring sections and loudness (this can take a few minutes for a long recording)");
+      py.FS.writeFile("/tmp/l.f32", new Uint8Array(msg.left));
+      py.FS.writeFile("/tmp/r.f32", new Uint8Array(msg.right));
+      const progress = (text) => say("measure", text);
+      const result = JSON.parse(py.pyimport("browser_entry").run("/tmp/l.f32", "/tmp/r.f32", msg.sampleRate, progress));
+      py.FS.unlink("/tmp/l.f32");
+      py.FS.unlink("/tmp/r.f32");
+      postMessage({ type: "result", report: result.report, markdown: result.markdown });
+    } catch (err) {
+      const lines = String(err && (err.message || err)).trim().split("\n");
+      postMessage({ type: "error", message: lines.slice(-3).join("\n") });
+    }
+  };
+}
+
+/* ---------- Page ---------- */
+const $ = (id) => document.getElementById(id);
+const STEPS = [
+  { id: "received", label: "File received" },
+  { id: "engine", label: "Loading the analysis engine" },
+  { id: "read", label: "Reading the audio in your browser" },
+  { id: "measure", label: "Finding sections and measuring" },
+];
+const state = {};          // id -> { status, text, startedAt }
+let lastMarkdown = "";
+let ticker = null;
+
+const worker = new Worker(URL.createObjectURL(new Blob([`(${workerMain.toString()})();`], { type: "text/javascript" })));
+const BASE_URL = new URL("./", location.href).href;
+
+function renderProgress() {
+  const now = Date.now();
+  $("progress").classList.remove("hidden");
+  $("progress").innerHTML = STEPS.map((s) => {
+    const st = state[s.id] || { status: "pending" };
+    const icon = st.status === "done" ? "✓" : st.status === "error" ? "✕" : st.status === "active" ? `<span class="spin">⟳</span>` : "○";
+    const elapsed = st.status === "active" && st.startedAt ? ` · ${Math.round((now - st.startedAt) / 1000)} s so far` : "";
+    const detail = st.text ? `<span class="detail">${st.text}${elapsed}</span>` : "";
+    return `<div class="step ${st.status}"><span class="icon">${icon}</span><span>${s.label}${detail}</span></div>`;
+  }).join("");
+}
+
+function setStep(id, status, text) {
+  const prev = state[id] || {};
+  state[id] = { status, text: text ?? prev.text, startedAt: status === "active" ? (prev.status === "active" ? prev.startedAt : Date.now()) : prev.startedAt };
+  renderProgress();
+  if (!ticker) ticker = setInterval(() => STEPS.some((s) => state[s.id] && state[s.id].status === "active") && renderProgress(), 1000);
+}
+
+function fail(message) {
+  const active = STEPS.find((s) => state[s.id] && state[s.id].status === "active");
+  if (ticker) { clearInterval(ticker); ticker = null; }
+  if (active) setStep(active.id, "error", message);
+  $("errorBox").textContent = `Could not check that file.\n${message}\n\nTry a WAV or MP3 export, or a shorter clip. If the problem is the engine, reload the page.`;
+  $("errorBox").classList.add("show");
+  $("engineBadge").textContent = "";
+}
+
+worker.onmessage = (e) => {
+  const msg = e.data;
+  if (msg.type === "step") setStep(msg.id, "active", msg.text);
+  if (msg.type === "stepDone") { setStep("engine", "done", "Ready"); $("engineBadge").textContent = ""; }
+  if (msg.type === "result") {
+    setStep("measure", "done", "Finished");
+    setStep("read", "done", state.read && state.read.text);
+    if (ticker) { clearInterval(ticker); ticker = null; }
+    render(msg.report, msg.markdown);
+  }
+  if (msg.type === "error") fail(msg.message);
+};
+worker.onerror = (e) => fail(e.message || "The analysis engine stopped unexpectedly.");
+
+
+async function decodeToStereo(file) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  try {
+    const buffer = await ctx.decodeAudioData(await file.arrayBuffer());
+    const left = buffer.getChannelData(0);
+    const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
+    return { left: left.slice().buffer, right: right.slice().buffer, sampleRate: buffer.sampleRate, seconds: buffer.duration };
+  } finally {
+    ctx.close();
+  }
+}
+
+function fmt(value, digits = 1) {
+  return value === null || value === undefined ? "too short" : Number(value).toFixed(digits);
+}
+function mmss(seconds) {
+  const s = Math.round(seconds);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return h ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+}
+
+function render(report, markdown) {
+  lastMarkdown = markdown;
+  $("sections").innerHTML = report.sections.map((s) => `
+    <tr>
+      <td>${s.name}</td><td>${s.type}</td><td>${s.source === "auto" ? "detected" : "marked"}</td>
+      <td>${mmss(s.start_s)}–${mmss(s.end_s)}</td><td>${fmt(s.integrated_lufs)}</td><td>${fmt(s.true_peak_dbtp)}</td>
+    </tr>`).join("");
+  $("notes").innerHTML = report.notes.length ? report.notes.map((n) => `
+    <div class="note"><div class="where">${n.section}</div><div>${n.message}</div>
+    ${n.console ? `<div class="console">Console: ${n.console}</div>` : ""}</div>`).join("")
+    : `<div class="hint">No issues against the current reference targets.</div>`;
+  $("results").classList.remove("hidden");
+}
+
+async function analyze(file) {
+  $("errorBox").classList.remove("show");
+  $("results").classList.add("hidden");
+  for (const s of STEPS) if (s.id !== "engine") delete state[s.id];
+  const sizeMb = (file.size / 1048576).toFixed(1);
+  setStep("received", "done", `${file.name} · ${sizeMb} MB`);
+  $("fileName").textContent = "";
+  if (!(state.engine && state.engine.status === "done")) {
+    // Start loading Python now, in parallel with decoding. The engine step shows its progress.
+    worker.postMessage({ type: "warm", baseUrl: BASE_URL });
+    setStep("engine", "active", "Loading the analysis engine (about 20 seconds the first time)");
+  }
+  setStep("read", "active", "Decoding the audio");
+  try {
+    const { left, right, sampleRate, seconds } = await decodeToStereo(file);
+    setStep("read", "done", `${mmss(seconds)} of audio read`);
+    setStep("measure", "active", "Starting the check");
+    worker.postMessage({ type: "analyze", baseUrl: BASE_URL, left, right, sampleRate }, [left, right]);
+  } catch (err) {
+    fail(`The browser could not decode this file (${err.message || err}).`);
+  }
+}
+
+const drop = $("drop");
+drop.addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", (e) => e.target.files[0] && analyze(e.target.files[0]));
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", (e) => {
+  e.preventDefault(); drop.classList.remove("over");
+  if (e.dataTransfer.files[0]) analyze(e.dataTransfer.files[0]);
+});
+
+$("copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(lastMarkdown);
+    $("copied").textContent = "Copied.";
+  } catch (err) {
+    $("copied").textContent = "Copy was blocked. Select the notes above and copy them.";
+  }
+});
+</script>
+</body>
+</html>

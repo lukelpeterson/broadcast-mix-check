@@ -1,0 +1,25 @@
+# Reference targets for the Broadcast Mix Check.
+# PLACEHOLDER VALUES. Matt's annotated church broadcast recordings should set these.
+# Measurements are compared against these numbers; tolerance_db applies to the spectral balance ratios.
+
+profiles:
+  worship:
+    integrated_lufs: -18
+    low_vs_mid_db: -4
+    harsh_vs_mid_db: -6
+    tolerance_db: 3
+  sermon:
+    integrated_lufs: -17
+    low_vs_mid_db: -6
+    harsh_vs_mid_db: -6
+    tolerance_db: 3
+  announcements:
+    integrated_lufs: -17
+    low_vs_mid_db: -6
+    harsh_vs_mid_db: -6
+    tolerance_db: 3
+
+checks:
+  loudness_tolerance_lu: 2
+  max_section_jump_db: 3
+  true_peak_ceiling_dbtp: -1.0
