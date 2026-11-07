@@ -123,6 +123,7 @@
 /* ---------- Background worker: loads Python and runs the check, so the page stays responsive ---------- */
 function workerMain() {
   const PYODIDE_VERSION = "0.26.4";
+  const BUILD = "2026-11-07-7";   // bump with each release so browsers fetch fresh engine files
   const PY_FILES = [
     "py/browser_entry.py",
     "py/automix/__init__.py", "py/automix/check.py", "py/automix/sections.py", "py/automix/reference_profiles.yaml",
@@ -142,7 +143,7 @@ function workerMain() {
         py.FS.mkdirTree("/home/pyodide/automix");
         py.FS.mkdirTree("/home/pyodide/pyloudnorm");
         for (const path of PY_FILES) {
-          const res = await fetch(new URL(path, baseUrl));
+          const res = await fetch(new URL(path, baseUrl).href + "?v=" + BUILD, { cache: "no-cache" });
           if (!res.ok) throw new Error(`Could not download ${path} (HTTP ${res.status}).`);
           const text = await res.text();
           py.FS.writeFile("/home/pyodide/" + path.replace(/^py\//, ""), text);
@@ -557,7 +558,7 @@ function applyReport(report, first) {
   autoNotes = new Map();
   autoTips = new Map();
   for (const sec of model.sections) autoNotes.set(sec.name, "No issues against the current reference targets.");
-  for (const n of report.section_notes) {
+  for (const n of report.section_notes || []) {
     autoNotes.set(n.section, n.message);
     if (n.console) autoTips.set(n.section, n.console);
   }
@@ -588,6 +589,9 @@ async function measure({ buffer, sampleRate, seconds }) {
   if (ticker) { clearInterval(ticker); ticker = null; }
   setStep("measure", "done", "Finished");
   setStep("read", "done", `${mmss(seconds)} of audio read`);
+  // The waveform and editor appear only once measuring has finished.
+  peaks = computePeaks(buffer);
+  $("results").classList.remove("hidden");
   applyReport(reply.result.report, true);
   setBusy("Drag a boundary or edit the times to re-measure.");
 }
@@ -617,11 +621,6 @@ async function analyze(file) {
   }
   totalSeconds = decoded.seconds;
   setStep("read", "done", `${mmss(decoded.seconds)} of audio read`);
-  // Show the waveform straight away, so there is something to look at while the measuring runs.
-  peaks = computePeaks(decoded.buffer);
-  $("results").classList.remove("hidden");
-  setBusy("Measuring. Sections and notes appear here when it finishes.");
-  drawWave();
   try {
     await measure(decoded);
   } catch (err) {
