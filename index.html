@@ -5,19 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Broadcast Mix Check (test)</title>
 <style>
-  /* Pacific Northwest palette: fog, conifer, moss, slate water, cedar. */
+  /* Cabin palette: flannel cream, pine, woodsmoke, rust and brass. */
   :root {
-    --bg:#eef1ec; --card:#fbfcfa; --ink:#1f2b27; --muted:#5f6e68; --line:#d6ddd7;
-    --accent:#2f6453; --accent-ink:#ffffff; --link:#3f6478; --soft:#e4ebe5;
-    --ok:#2f7a55; --warn:#8a5234; --warn-bg:#f5ebe2; --bad:#a3352b; --bad-bg:#f8e9e6;
-    --shadow: 0 1px 2px rgba(31,43,39,.06), 0 6px 18px rgba(31,43,39,.06);
+    --bg:#f3ece0; --card:#fbf7ef; --ink:#2b2119; --muted:#7a6a58; --line:#dccfbb;
+    --accent:#4a5d3a; --accent-ink:#fbf7ef; --link:#8a4f2a; --soft:#ebe0cc;
+    --ok:#4a6b3a; --warn:#9a5a1e; --warn-bg:#f6e6cc; --bad:#9b3323; --bad-bg:#f5dfd6;
+    --shadow: 0 1px 2px rgba(43,33,25,.07), 0 6px 18px rgba(43,33,25,.07);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#141c19; --card:#1c2622; --ink:#e4ebe6; --muted:#9aa9a2; --line:#2e3c36;
-      --accent:#7fb49c; --accent-ink:#0f1714; --link:#9cc3d6; --soft:#23302b;
-      --ok:#7fc49c; --warn:#e0a27c; --warn-bg:#2d2119; --bad:#f0a196; --bad-bg:#2e1c1a;
-      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+      --bg:#1e1812; --card:#2a2219; --ink:#efe4d2; --muted:#a8977f; --line:#43372a;
+      --accent:#9bb57f; --accent-ink:#1e1812; --link:#e0a574; --soft:#342a1f;
+      --ok:#9bc48a; --warn:#e8b27a; --warn-bg:#352a1c; --bad:#eb9d88; --bad-bg:#3a2521;
+      --shadow: 0 1px 2px rgba(0,0,0,.35), 0 8px 24px rgba(0,0,0,.28);
     }
   }
   * { box-sizing: border-box; }
@@ -25,14 +25,14 @@
     margin:0; min-height:100vh;
     font:16px/1.55 "Avenir Next", "Segoe UI", system-ui, -apple-system, sans-serif;
     color:var(--ink); background:var(--bg);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1440 180' preserveAspectRatio='none'%3E%3Cpath fill='%232f6453' fill-opacity='.10' d='M0 120 L120 70 L210 105 L330 40 L450 95 L560 60 L680 110 L800 50 L930 100 L1040 65 L1160 105 L1280 55 L1440 95 L1440 180 L0 180Z'/%3E%3Cpath fill='%233f6478' fill-opacity='.08' d='M0 150 L150 110 L260 135 L380 98 L520 140 L640 115 L780 145 L900 105 L1020 138 L1150 112 L1290 142 L1440 120 L1440 180 L0 180Z'/%3E%3C/svg%3E");
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1440 180' preserveAspectRatio='none'%3E%3Cpath fill='%234a5d3a' fill-opacity='.14' d='M0 120 L120 70 L210 105 L330 40 L450 95 L560 60 L680 110 L800 50 L930 100 L1040 65 L1160 105 L1280 55 L1440 95 L1440 180 L0 180Z'/%3E%3Cpath fill='%238a4f2a' fill-opacity='.10' d='M0 150 L150 110 L260 135 L380 98 L520 140 L640 115 L780 145 L900 105 L1020 138 L1150 112 L1290 142 L1440 120 L1440 180 L0 180Z'/%3E%3C/svg%3E");
     background-repeat:no-repeat; background-position:top center; background-size:100% 180px;
   }
   @media (prefers-color-scheme: dark) {
-    body { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1440 180' preserveAspectRatio='none'%3E%3Cpath fill='%237fb49c' fill-opacity='.10' d='M0 120 L120 70 L210 105 L330 40 L450 95 L560 60 L680 110 L800 50 L930 100 L1040 65 L1160 105 L1280 55 L1440 95 L1440 180 L0 180Z'/%3E%3Cpath fill='%239cc3d6' fill-opacity='.07' d='M0 150 L150 110 L260 135 L380 98 L520 140 L640 115 L780 145 L900 105 L1020 138 L1150 112 L1290 142 L1440 120 L1440 180 L0 180Z'/%3E%3C/svg%3E"); }
+    body { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1440 180' preserveAspectRatio='none'%3E%3Cpath fill='%239bb57f' fill-opacity='.12' d='M0 120 L120 70 L210 105 L330 40 L450 95 L560 60 L680 110 L800 50 L930 100 L1040 65 L1160 105 L1280 55 L1440 95 L1440 180 L0 180Z'/%3E%3Cpath fill='%23e0a574' fill-opacity='.09' d='M0 150 L150 110 L260 135 L380 98 L520 140 L640 115 L780 145 L900 105 L1020 138 L1150 112 L1290 142 L1440 120 L1440 180 L0 180Z'/%3E%3C/svg%3E"); }
   }
   main { max-width:880px; margin:0 auto; padding:44px 18px 60px; }
-  h1 { font-size:30px; font-weight:650; letter-spacing:-.01em; margin:0 0 4px; }
+  h1 { font-family:Georgia, "Iowan Old Style", "Palatino Linotype", serif; font-size:32px; font-weight:600; letter-spacing:-.01em; margin:0 0 4px; }
   h2 { font-size:13px; font-weight:650; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 12px; }
   .lede { color:var(--muted); margin:0 0 22px; max-width:640px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:22px; margin-bottom:18px; box-shadow:var(--shadow); }

@@ -25,9 +25,6 @@ STEM_ACTIVE_DB = -40.0      # speech stem counts as active above this level
 STEM_ACTIVE_FRACTION = 0.5  # share of a block the stem must be active for speech
 FRAME_MS = 20
 MEDIAN_BLOCKS = 31          # smoothing window in blocks (about 30 s at 1 s blocks)
-SERMON_MIN_S = 300.0        # speech runs at least this long are a sermon, placeholder
-
-
 def _frame_db(x, sr):
     n = max(1, int(sr * FRAME_MS / 1000))
     usable = len(x) // n * n
@@ -115,15 +112,11 @@ def _merge_short(runs, min_len_s):
     return runs
 
 
-def _speech_kind(duration_s, sermon_min_s):
-    return "sermon" if duration_s >= sermon_min_s else "announcements"
-
-
-def spans_from_labels(labels, block_s=1.0, min_len_s=60.0, sermon_min_s=SERMON_MIN_S):
+def spans_from_labels(labels, block_s=1.0, min_len_s=60.0):
     """Turn per-block labels (0 music, 1 speech, no silence) into named spans.
 
-    Music runs are "worship". Speech runs are "sermon" when long enough, otherwise
-    "announcements" (welcome, notices, prayer and similar short talk).
+    Music runs are "worship" and speech runs are "sermon". Telling short announcements
+    apart from the sermon is not reliable yet, so both are "sermon".
     """
     if len(labels) == 0:
         return []
@@ -132,10 +125,7 @@ def spans_from_labels(labels, block_s=1.0, min_len_s=60.0, sermon_min_s=SERMON_M
 
     spans, counts = [], {}
     for r in runs:
-        if r["label"] == 1:
-            kind = _speech_kind(r["end_s"] - r["start_s"], sermon_min_s)
-        else:
-            kind = "worship"
+        kind = "sermon" if r["label"] == 1 else "worship"
         counts[kind] = counts.get(kind, 0) + 1
         spans.append({
             "name": f"{kind} {counts[kind]}",
@@ -147,7 +137,7 @@ def spans_from_labels(labels, block_s=1.0, min_len_s=60.0, sermon_min_s=SERMON_M
     return spans
 
 
-def detect(mono, sr, speech_audio=None, block_s=1.0, min_len_s=60.0, sermon_min_s=SERMON_MIN_S):
+def detect(mono, sr, speech_audio=None, block_s=1.0, min_len_s=60.0):
     """Return a list of spans: {name, type, start_s, end_s}. Empty if there is too little audio."""
     mono = np.asarray(mono, dtype=np.float64)
     block = int(sr * block_s)
@@ -162,7 +152,7 @@ def detect(mono, sr, speech_audio=None, block_s=1.0, min_len_s=60.0, sermon_min_
     else:
         labels = fill_silence(_mixdown_labels(mono, sr, block))
 
-    return spans_from_labels(labels, block_s, min_len_s, sermon_min_s)
+    return spans_from_labels(labels, block_s, min_len_s)
 
 
 def combine_markers(detected, markers, total_s):
