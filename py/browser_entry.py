@@ -27,3 +27,11 @@ def feed(left_path, right_path):
 def finish():
     report = _session.finish(file_name="recording")
     return json.dumps({"report": report, "markdown": check.render_markdown(report)})
+
+
+def relabel(sections_json):
+    """Re-measure with the sections the user has set (their markers cover the whole recording).
+    Uses the summaries kept from the first pass, so the audio is not read again."""
+    spec = json.loads(sections_json)
+    report = _session.finish(sections_spec=spec, auto=False, file_name="recording")
+    return json.dumps({"report": report, "markdown": check.render_markdown(report)})

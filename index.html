@@ -40,19 +40,33 @@
   .drop:hover, .drop.over { border-color:var(--accent); background:transparent; }
   .drop strong { color:var(--accent); font-weight:650; }
   .hint { font-size:13px; color:var(--muted); margin-top:8px; }
-  table { width:100%; border-collapse:collapse; font-size:14px; }
-  th,td { text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { color:var(--muted); font-size:11px; font-weight:650; text-transform:uppercase; letter-spacing:.07em; }
-  td { font-variant-numeric: tabular-nums; }
-  .note { border-left:3px solid var(--accent); background:var(--soft); padding:11px 14px; margin:10px 0; border-radius:0 10px 10px 0; font-size:14px; }
-  .note .where { font-weight:650; color:var(--ink); font-size:13px; }
-  .note .console { margin-top:4px; color:var(--link); }
+  .note-text { font:inherit; font-size:14px; }
+  .console { font-size:13px; color:var(--link); margin-top:4px; }
+  input, select { font:inherit; font-size:14px; padding:5px 8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); }
+  input:disabled { opacity:.55; }
   button { font:inherit; padding:9px 16px; border-radius:999px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; transition:background .15s; }
   button:hover { background:var(--soft); }
   button.primary { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); font-weight:650; }
   button.primary:hover { filter:brightness(1.08); background:var(--accent); }
+  button.reset { margin-top:6px; padding:3px 10px; font-size:12px; }
   .placeholder { background:var(--warn-bg); border:1px solid transparent; color:var(--warn); border-radius:12px; padding:11px 14px; font-size:14px; margin-bottom:18px; }
   .hidden { display:none; }
+
+  /* waveform and section editor */
+  .wave { width:100%; height:150px; display:block; border-radius:12px; background:var(--soft); touch-action:none; }
+  .sec { border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; background:var(--card); }
+  .sec-head, .sec-times { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .sec-head .name { font-weight:650; font-size:16px; border:1px solid transparent; background:transparent; min-width:200px; }
+  .sec-head .name:hover, .sec-head .name:focus { border-color:var(--line); background:var(--card); outline:none; }
+  .src { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.07em; }
+  .sec-times label { font-size:13px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  .sec-times input { width:96px; font-variant-numeric:tabular-nums; }
+  .metrics { font-size:13px; color:var(--muted); margin-left:auto; font-variant-numeric:tabular-nums; }
+  textarea.note-text { width:100%; margin-top:10px; padding:8px 10px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--ink); resize:vertical; min-height:56px; }
+  #busy { min-height:1.4em; }
+
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th,td { text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
 
   /* progress */
   #progress { margin-top:14px; }
@@ -92,13 +106,15 @@
   </section>
 
   <section id="results" class="card hidden">
-    <h2>Sections</h2>
-    <table>
-      <thead><tr><th>Section</th><th>Type</th><th>Source</th><th>Time</th><th>LUFS</th><th>Peak dBTP</th></tr></thead>
-      <tbody id="sections"></tbody>
-    </table>
-    <h2 style="margin-top:18px">Notes for next Sunday</h2>
-    <div id="notes"></div>
+    <h2>2. Sections and notes</h2>
+    <canvas id="wave" class="wave" aria-label="Waveform. Drag a boundary line to move it."></canvas>
+    <div class="hint">Drag a boundary line on the waveform, or type times below. Measurements update when you let go.</div>
+    <div id="busy" class="hint"></div>
+    <div id="sections"></div>
+    <div id="transitionsWrap" class="hidden">
+      <h2 style="margin-top:18px">Between sections</h2>
+      <div id="transitions"></div>
+    </div>
     <div style="margin-top:14px"><button id="copy" class="primary">Copy report (Markdown)</button> <span id="copied" class="hint"></span></div>
   </section>
 </main>
@@ -163,6 +179,11 @@ function workerMain() {
         const result = JSON.parse(engine.finish());
         return postMessage({ type: "ack", result });
       }
+      if (msg.type === "relabel") {
+        // Re-measures with the sections the user set, using the summaries kept from the first pass.
+        const result = JSON.parse(engine.relabel(msg.spec));
+        return postMessage({ type: "ack", result });
+      }
     } catch (err) {
       postMessage({ type: "error", message: String(err && (err.message || err)).trim().slice(-2000) });
     }
@@ -171,6 +192,7 @@ function workerMain() {
 
 /* ---------- Page ---------- */
 const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const STEPS = [
   { id: "received", label: "File received" },
   { id: "engine", label: "Loading the analysis engine" },
@@ -178,8 +200,19 @@ const STEPS = [
   { id: "measure", label: "Finding sections and measuring" },
 ];
 const state = {};          // id -> { status, text, startedAt }
-let lastMarkdown = "";
 let ticker = null;
+let currentFileName = "recording";
+let totalSeconds = 0;
+
+// Editor state. model.sections holds what the user sees and edits; the notes maps hold
+// the automatic notes from the last measurement and anything the user typed over them.
+let model = null;                 // { total, sections: [{ name, type, start, end, source, metrics }] }
+let autoNotes = new Map();        // key (section name or "A to B") -> automatic note
+let autoTips = new Map();         // key -> console tip
+const userNotes = new Map();      // key -> the user's own note text
+let peaks = null;                 // waveform peaks, 0..1 per bucket
+let dragIndex = null;             // which boundary is being dragged
+let relabelTimer = null, relabelBusy = false, relabelAgain = false;
 
 const worker = new Worker(URL.createObjectURL(new Blob([`(${workerMain.toString()})();`], { type: "text/javascript" })));
 const BASE_URL = new URL("./", location.href).href;
@@ -227,16 +260,15 @@ worker.onmessage = (e) => {
   if (msg.type === "stepDone") { setStep("engine", "done", "Ready"); $("engineBadge").textContent = ""; }
   if (msg.type === "ack" && waiter) { const w = waiter; waiter = null; w.resolve(msg); }
   if (msg.type === "error") {
-    fail(msg.message);
     if (waiter) { const w = waiter; waiter = null; w.reject(new Error(msg.message)); }
+    else fail(msg.message);
   }
 };
 worker.onerror = (e) => {
   const message = e.message || "The analysis engine stopped unexpectedly.";
-  fail(message);
   if (waiter) { const w = waiter; waiter = null; w.reject(new Error(message)); }
+  else fail(message);
 };
-
 
 async function decodeToStereo(file) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
@@ -258,25 +290,316 @@ function mmss(seconds) {
   const pad = (n) => String(n).padStart(2, "0");
   return h ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
 }
+// Accepts 90, 1:30 or 1:20:55. Returns seconds, or null if it does not read as a time.
+function parseTime(text) {
+  const parts = String(text).trim().split(":").map(Number);
+  if (!parts.length || parts.some((p) => !Number.isFinite(p) || p < 0)) return null;
+  return parts.reduce((acc, p) => acc * 60 + p, 0);
+}
 
-function render(report, markdown) {
-  lastMarkdown = markdown;
-  $("sections").innerHTML = report.sections.map((s) => `
-    <tr>
-      <td>${s.name}</td><td>${s.type}</td><td>${s.source === "auto" ? "detected" : "marked"}</td>
-      <td>${mmss(s.start_s)}–${mmss(s.end_s)}</td><td>${fmt(s.integrated_lufs)}</td><td>${fmt(s.true_peak_dbtp)}</td>
-    </tr>`).join("");
-  $("notes").innerHTML = report.notes.length ? report.notes.map((n) => `
-    <div class="note"><div class="where">${n.section}</div><div>${n.message}</div>
-    ${n.console ? `<div class="console">Console: ${n.console}</div>` : ""}</div>`).join("")
-    : `<div class="hint">No issues against the current reference targets.</div>`;
-  $("results").classList.remove("hidden");
+/* ---------- Waveform ---------- */
+function computePeaks(buffer, buckets = 1200) {
+  const left = buffer.getChannelData(0);
+  const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
+  const total = left.length, per = total / buckets;
+  const out = new Float32Array(buckets);
+  let max = 0;
+  for (let b = 0; b < buckets; b++) {
+    const from = Math.floor(b * per), to = Math.floor((b + 1) * per);
+    let m = 0;
+    for (let i = from; i < to; i += 4) {          // every 4th sample is plenty for a picture
+      const v = Math.abs(left[i]);
+      if (v > m) m = v;
+      if (right) { const u = Math.abs(right[i]); if (u > m) m = u; }
+    }
+    out[b] = m;
+    if (m > max) max = m;
+  }
+  if (max > 0) for (let b = 0; b < buckets; b++) out[b] /= max;
+  return out;
+}
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function drawWave() {
+  const canvas = $("wave");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const mid = h / 2 - 6;
+  const total = model ? model.total : totalSeconds;
+
+  if (model) {
+    model.sections.forEach((s, i) => {
+      const x0 = (s.start / total) * w, x1 = (s.end / total) * w;
+      g.fillStyle = i % 2 ? cssVar("--soft") : "transparent";
+      g.fillRect(x0, 0, x1 - x0, h);
+    });
+  }
+  if (peaks) {
+    const bw = w / peaks.length;
+    for (let b = 0; b < peaks.length; b++) {
+      const t = ((b + 0.5) / peaks.length) * total;
+      const sec = model && model.sections.find((s) => t >= s.start && t < s.end);
+      g.fillStyle = sec && sec.type === "sermon" ? cssVar("--link") : cssVar("--accent");
+      const bh = Math.max(1, peaks[b] * (mid - 4));
+      g.fillRect(b * bw, mid - bh, Math.max(1, bw), bh * 2);
+    }
+  }
+  if (model) {
+    g.font = "13px system-ui, sans-serif";
+    model.sections.forEach((s, i) => {
+      const x0 = (s.start / total) * w, x1 = (s.end / total) * w;
+      if (i > 0) {
+        g.fillStyle = cssVar("--ink");
+        g.fillRect(x0 - 1, 0, 2, h);
+        g.beginPath(); g.arc(x0, 8, 5, 0, Math.PI * 2); g.fill();
+      }
+      if (x1 - x0 > 60) {
+        g.fillStyle = cssVar("--ink");
+        g.fillText(s.name, x0 + 8, 22, x1 - x0 - 12);
+      }
+    });
+  }
+  g.fillStyle = cssVar("--muted");
+  g.font = "12px system-ui, sans-serif";
+  g.fillText("0:00", 6, h - 6);
+  g.textAlign = "right";
+  g.fillText(mmss(total), w - 6, h - 6);
+  g.textAlign = "left";
+}
+
+function nearestBoundary(clientX) {
+  if (!model) return -1;
+  const r = $("wave").getBoundingClientRect();
+  let best = -1, bestDist = 9;
+  for (let i = 1; i < model.sections.length; i++) {
+    const x = r.left + (model.sections[i].start / model.total) * r.width;
+    const d = Math.abs(clientX - x);
+    if (d < bestDist) { best = i; bestDist = d; }
+  }
+  return best;
+}
+
+function timeAt(clientX) {
+  const r = $("wave").getBoundingClientRect();
+  return Math.min(1, Math.max(0, (clientX - r.left) / r.width)) * model.total;
+}
+
+$("wave").addEventListener("pointerdown", (e) => {
+  const i = nearestBoundary(e.clientX);
+  if (i < 0) return;
+  dragIndex = i;
+  $("wave").setPointerCapture(e.pointerId);
+});
+$("wave").addEventListener("pointermove", (e) => {
+  if (dragIndex === null) {
+    $("wave").style.cursor = nearestBoundary(e.clientX) >= 0 ? "col-resize" : "default";
+    return;
+  }
+  const prev = model.sections[dragIndex - 1], cur = model.sections[dragIndex];
+  const t = Math.min(Math.max(timeAt(e.clientX), prev.start + 1), cur.end - 1);
+  prev.end = cur.start = Math.round(t * 10) / 10;
+  prev.source = cur.source = "edited";
+  drawWave();
+  syncTimeInputs();
+});
+function endDrag() {
+  if (dragIndex === null) return;
+  dragIndex = null;
+  renderEditor();
+  scheduleRelabel();
+}
+$("wave").addEventListener("pointerup", endDrag);
+$("wave").addEventListener("pointercancel", endDrag);
+
+/* ---------- Section editor ---------- */
+function textFor(key) {
+  return userNotes.has(key) ? userNotes.get(key) : (autoNotes.get(key) ?? "");
+}
+
+function noteBox(key) {
+  const tip = autoTips.get(key);
+  return `<div>
+    <textarea class="note-text" data-key="${esc(key)}" rows="2">${esc(textFor(key))}</textarea>
+    ${tip ? `<div class="console">Console: ${esc(tip)}</div>` : ""}
+    ${userNotes.has(key) ? `<button class="reset" data-key="${esc(key)}">Use the automatic note</button>` : ""}
+  </div>`;
+}
+
+function renderEditor() {
+  if (!model) return;
+  const names = new Set(model.sections.map((s) => s.name));
+  $("sections").innerHTML = model.sections.map((s, i) => {
+    const m = s.metrics || {};
+    const last = i === model.sections.length - 1;
+    return `<div class="sec">
+      <div class="sec-head">
+        <input class="name" data-i="${i}" value="${esc(s.name)}" aria-label="Section name">
+        <select class="type" data-i="${i}" aria-label="Section type">
+          <option value="worship"${s.type === "worship" ? " selected" : ""}>Worship</option>
+          <option value="sermon"${s.type === "sermon" ? " selected" : ""}>Sermon</option>
+        </select>
+        <span class="src">${esc(s.source)}</span>
+        <span class="metrics">${fmt(m.integrated_lufs)} LUFS · peak ${fmt(m.true_peak_dbtp)} dBTP · low vs mid ${fmt(m.low_vs_mid_db)} dB · 2-5 kHz vs mid ${fmt(m.harsh_vs_mid_db)} dB</span>
+      </div>
+      <div class="sec-times" style="margin-top:10px">
+        <label>Start <input class="start" data-i="${i}" value="${mmss(s.start)}" ${i === 0 ? "disabled" : ""}></label>
+        <label>End <input class="end" data-i="${i}" value="${mmss(s.end)}" ${last ? "disabled" : ""}></label>
+      </div>
+      ${noteBox(s.name)}
+    </div>`;
+  }).join("");
+
+  const transitions = [...new Set([...autoNotes.keys(), ...userNotes.keys()])].filter((k) => !names.has(k));
+  $("transitionsWrap").classList.toggle("hidden", transitions.length === 0);
+  $("transitions").innerHTML = transitions.map((k) => `
+    <div class="sec"><div class="sec-head"><strong>${esc(k)}</strong></div>${noteBox(k)}</div>`).join("");
+  drawWave();
+}
+
+// Updates only the time fields, so a field the user is typing in is not replaced while dragging.
+function syncTimeInputs() {
+  document.querySelectorAll("#sections .start").forEach((el) => { el.value = mmss(model.sections[Number(el.dataset.i)].start); });
+  document.querySelectorAll("#sections .end").forEach((el) => { el.value = mmss(model.sections[Number(el.dataset.i)].end); });
+}
+
+$("sections").addEventListener("change", (e) => {
+  const el = e.target;
+  const i = Number(el.dataset.i);
+  if (!model || Number.isNaN(i)) return;
+  const sec = model.sections[i];
+  if (el.classList.contains("name")) {
+    const old = sec.name, next = el.value.trim() || old;
+    if (next !== old) {
+      if (userNotes.has(old)) { userNotes.set(next, userNotes.get(old)); userNotes.delete(old); }
+      sec.name = next;
+      sec.source = "edited";
+    }
+  } else if (el.classList.contains("type")) {
+    sec.type = el.value;
+  } else if (el.classList.contains("start")) {
+    const t = parseTime(el.value);
+    const prev = model.sections[i - 1];
+    if (t !== null) {
+      const v = Math.min(Math.max(t, prev.start + 1), sec.end - 1);
+      prev.end = sec.start = Math.round(v * 10) / 10;
+      prev.source = sec.source = "edited";
+    }
+  } else if (el.classList.contains("end")) {
+    const t = parseTime(el.value);
+    const next = model.sections[i + 1];
+    if (t !== null) {
+      const v = Math.min(Math.max(t, sec.start + 1), next.end - 1);
+      sec.end = next.start = Math.round(v * 10) / 10;
+      sec.source = next.source = "edited";
+    }
+  }
+  renderEditor();
+  scheduleRelabel();
+});
+
+// Typed notes are kept; the automatic text only comes back when the user asks for it.
+document.addEventListener("input", (e) => {
+  if (e.target.classList && e.target.classList.contains("note-text")) userNotes.set(e.target.dataset.key, e.target.value);
+});
+document.addEventListener("click", (e) => {
+  if (e.target.classList && e.target.classList.contains("reset")) {
+    userNotes.delete(e.target.dataset.key);
+    renderEditor();
+  }
+});
+
+function setBusy(text) { $("busy").textContent = text; }
+
+function scheduleRelabel() {
+  clearTimeout(relabelTimer);
+  relabelTimer = setTimeout(runRelabel, 250);
+}
+
+async function runRelabel() {
+  if (!model) return;
+  if (relabelBusy) { relabelAgain = true; return; }
+  relabelBusy = true;
+  setBusy("Re-measuring with your changes…");
+  try {
+    const spec = model.sections.map((s) => ({ name: s.name, type: s.type, start_s: s.start, end_s: s.end, source: "manual" }));
+    const reply = await ask({ type: "relabel", spec: JSON.stringify(spec) });
+    applyReport(reply.result.report, false);
+    setBusy("Updated.");
+  } catch (err) {
+    setBusy(`Could not re-measure: ${err.message || err}`);
+  } finally {
+    relabelBusy = false;
+    if (relabelAgain) { relabelAgain = false; runRelabel(); }
+  }
+}
+
+function applyReport(report, first) {
+  if (first) {
+    model = {
+      total: totalSeconds,
+      sections: report.sections.map((s) => ({
+        name: s.name, type: s.type, start: s.start_s, end: s.end_s,
+        source: s.source === "auto" ? "detected" : "marked", metrics: s,
+      })),
+    };
+  } else {
+    if (report.sections.length !== model.sections.length) return;
+    model.sections.forEach((sec, i) => { sec.metrics = report.sections[i]; });
+  }
+  autoNotes = new Map();
+  autoTips = new Map();
+  for (const sec of model.sections) autoNotes.set(sec.name, "No issues against the current reference targets.");
+  for (const n of report.section_notes) {
+    autoNotes.set(n.section, n.message);
+    if (n.console) autoTips.set(n.section, n.console);
+  }
+  renderEditor();
+}
+
+/* ---------- Run ---------- */
+async function measure({ buffer, sampleRate, seconds }) {
+  const left = buffer.getChannelData(0);
+  const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
+  const total = left.length;
+  const piece = sampleRate * 30;
+  setStep("measure", "active", `Measuring the audio: 0:00 of ${mmss(seconds)} (0%)`);
+  await ask({ type: "start", baseUrl: BASE_URL, sampleRate });
+  for (let i = 0; i < total; i += piece) {
+    const l = left.slice(i, i + piece).buffer;
+    const r = right.slice(i, i + piece).buffer;
+    await ask({ type: "chunk", left: l, right: r }, [l, r]);
+    const done = Math.min(i + piece, total);
+    const pct = Math.round((100 * done) / total);
+    const text = done < total
+      ? `Measuring the audio: ${mmss(done / sampleRate)} of ${mmss(seconds)} (${pct}%)`
+      : `Measured all ${mmss(seconds)} of audio`;
+    setStep("measure", "active", text);
+  }
+  setStep("measure", "active", "Finding sections and writing notes");
+  const reply = await ask({ type: "finish" });
+  if (ticker) { clearInterval(ticker); ticker = null; }
+  setStep("measure", "done", "Finished");
+  setStep("read", "done", `${mmss(seconds)} of audio read`);
+  applyReport(reply.result.report, true);
+  setBusy("Drag a boundary or edit the times to re-measure.");
 }
 
 async function analyze(file) {
   $("errorBox").classList.remove("show");
   $("results").classList.add("hidden");
   for (const s of STEPS) if (s.id !== "engine") delete state[s.id];
+  model = null;
+  peaks = null;
+  userNotes.clear();
+  currentFileName = file.name;
   const sizeMb = (file.size / 1048576).toFixed(1);
   setStep("received", "done", `${file.name} · ${sizeMb} MB`);
   $("fileName").textContent = "";
@@ -292,39 +615,18 @@ async function analyze(file) {
   } catch (err) {
     return fail(`The browser could not decode this file (${err.message || err}).`);
   }
+  totalSeconds = decoded.seconds;
   setStep("read", "done", `${mmss(decoded.seconds)} of audio read`);
+  // Show the waveform straight away, so there is something to look at while the measuring runs.
+  peaks = computePeaks(decoded.buffer);
+  $("results").classList.remove("hidden");
+  setBusy("Measuring. Sections and notes appear here when it finishes.");
+  drawWave();
   try {
     await measure(decoded);
   } catch (err) {
     fail(err.message || String(err));
   }
-}
-
-// Sends the audio to the engine 30 seconds at a time, waiting for each piece to be measured.
-async function measure({ buffer, sampleRate, seconds }) {
-  const left = buffer.getChannelData(0);
-  const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
-  const total = left.length;
-  const piece = sampleRate * 30;
-  setStep("measure", "active", `Measuring the audio: 0:00 of ${mmss(seconds)} (0%)`);
-  await ask({ type: "start", baseUrl: BASE_URL, sampleRate });
-  for (let i = 0; i < total; i += piece) {
-    const l = left.slice(i, i + piece).buffer;
-    const r = right.slice(i, i + piece).buffer;
-    const reply = await ask({ type: "chunk", left: l, right: r }, [l, r]);
-    const done = Math.min(i + piece, total);
-    const pct = Math.round((100 * done) / total);
-    const text = done < total
-      ? `Measuring the audio: ${mmss(done / sampleRate)} of ${mmss(seconds)} (${pct}%)`
-      : `Measured all ${mmss(seconds)} of audio`;
-    setStep("measure", "active", text);
-  }
-  setStep("measure", "active", "Finding sections and writing notes");
-  const reply = await ask({ type: "finish" });
-  if (ticker) { clearInterval(ticker); ticker = null; }
-  setStep("measure", "done", "Finished");
-  setStep("read", "done", `${mmss(seconds)} of audio read`);
-  render(reply.result.report, reply.result.markdown);
 }
 
 const drop = $("drop");
@@ -336,10 +638,36 @@ drop.addEventListener("drop", (e) => {
   e.preventDefault(); drop.classList.remove("over");
   if (e.dataTransfer.files[0]) analyze(e.dataTransfer.files[0]);
 });
+window.addEventListener("resize", () => drawWave());
+
+/* ---------- Copy ---------- */
+function buildMarkdown() {
+  if (!model) return "";
+  const flat = (t) => String(t).replace(/\s*\n\s*/g, " ").trim();
+  const lines = [`# Broadcast Mix Check: ${currentFileName}`, "", "## Sections", ""];
+  for (const s of model.sections) {
+    const m = s.metrics || {};
+    const lufs = m.integrated_lufs != null ? `${m.integrated_lufs} LUFS` : "too short to measure";
+    lines.push(
+      `- **${s.name}** (${s.type}, ${s.source}, ${s.start.toFixed(1)}-${s.end.toFixed(1)} s): ${lufs}, ` +
+      `peak ${fmt(m.true_peak_dbtp)} dBTP, low vs mid ${fmt(m.low_vs_mid_db)} dB, 2-5 kHz vs mid ${fmt(m.harsh_vs_mid_db)} dB`
+    );
+  }
+  lines.push("", "## Notes for next Sunday", "");
+  const names = new Set(model.sections.map((s) => s.name));
+  const keys = [...model.sections.map((s) => s.name),
+    ...[...new Set([...autoNotes.keys(), ...userNotes.keys()])].filter((k) => !names.has(k))];
+  for (const k of keys) {
+    lines.push(`- **${k}:** ${flat(textFor(k))}`);
+    if (autoTips.has(k)) lines.push(`  - Console: ${autoTips.get(k)}`);
+  }
+  lines.push("", "_Targets are placeholders until the reference recordings are annotated._", "");
+  return lines.join("\n");
+}
 
 $("copy").addEventListener("click", async () => {
   try {
-    await navigator.clipboard.writeText(lastMarkdown);
+    await navigator.clipboard.writeText(buildMarkdown());
     $("copied").textContent = "Copied.";
   } catch (err) {
     $("copied").textContent = "Copy was blocked. Select the notes above and copy them.";

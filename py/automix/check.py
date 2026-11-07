@@ -231,11 +231,13 @@ class StreamAnalyzer:
                 "end_s": round(end_s, 1),
                 **self._metrics(start_s, end_s),
             })
+        notes = find_issues(sections, ref)
         return {
             "file": file_name,
             "sample_rate": self.sr,
             "sections": sections,
-            "notes": find_issues(sections, ref),
+            "notes": notes,
+            "section_notes": group_notes(notes),
         }
 
 
@@ -301,6 +303,20 @@ def find_issues(sections, ref):
     return notes
 
 
+def group_notes(notes):
+    """One note per section: its issues joined into a single paragraph, with repeated console tips merged."""
+    grouped = {}
+    for n in notes:
+        g = grouped.setdefault(n["section"], {"messages": [], "consoles": []})
+        g["messages"].append(n["message"])
+        if n["console"] and n["console"] not in g["consoles"]:
+            g["consoles"].append(n["console"])
+    return [
+        {"section": name, "message": " ".join(g["messages"]), "console": " ".join(g["consoles"]) or None}
+        for name, g in grouped.items()
+    ]
+
+
 def _tell(progress, text):
     if progress:
         progress(text)
@@ -350,9 +366,9 @@ def render_markdown(report):
             f"2-5 kHz vs mid {s['harsh_vs_mid_db']} dB"
         )
     lines += ["", "## Notes for next Sunday", ""]
-    if not report["notes"]:
+    if not report["section_notes"]:
         lines.append("No issues against the current reference targets.")
-    for n in report["notes"]:
+    for n in report["section_notes"]:
         lines.append(f"- **{n['section']}:** {n['message']}")
         if n["console"]:
             lines.append(f"  - Console: {n['console']}")
