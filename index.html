@@ -100,7 +100,9 @@ function workerMain() {
         py.FS.mkdirTree("/home/pyodide/automix");
         py.FS.mkdirTree("/home/pyodide/pyloudnorm");
         for (const path of PY_FILES) {
-          const text = await (await fetch(new URL(path, baseUrl))).text();
+          const res = await fetch(new URL(path, baseUrl));
+          if (!res.ok) throw new Error(`Could not download ${path} (HTTP ${res.status}).`);
+          const text = await res.text();
           py.FS.writeFile("/home/pyodide/" + path.replace(/^py\//, ""), text);
         }
         py.runPython("import sys; sys.path.insert(0, '/home/pyodide')");
@@ -125,8 +127,7 @@ function workerMain() {
       py.FS.unlink("/tmp/r.f32");
       postMessage({ type: "result", report: result.report, markdown: result.markdown });
     } catch (err) {
-      const lines = String(err && (err.message || err)).trim().split("\n");
-      postMessage({ type: "error", message: lines.slice(-3).join("\n") });
+      postMessage({ type: "error", message: String(err && (err.message || err)).trim().slice(-2000) });
     }
   };
 }
@@ -169,7 +170,7 @@ function fail(message) {
   const active = STEPS.find((s) => state[s.id] && state[s.id].status === "active");
   if (ticker) { clearInterval(ticker); ticker = null; }
   if (active) setStep(active.id, "error", message);
-  $("errorBox").textContent = `Could not check that file.\n${message}\n\nTry a WAV or MP3 export, or a shorter clip. If the problem is the engine, reload the page.`;
+  $("errorBox").textContent = `Could not check that file.\n\n${message}\n\nTry a WAV or MP3 export, or a shorter clip. If the problem is the engine, reload the page.`;
   $("errorBox").classList.add("show");
   $("engineBadge").textContent = "";
 }
