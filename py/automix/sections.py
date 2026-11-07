@@ -11,6 +11,9 @@ Two input modes:
 
 Every threshold below is a placeholder until Matt's annotated recordings can
 check them. Manual markers always win over detected spans (see combine_markers).
+
+The per-block functions are used one second at a time by the streaming analyzer
+in check.py, so long recordings never need to be held in memory whole.
 """
 import numpy as np
 from scipy.ndimage import median_filter
@@ -22,6 +25,7 @@ STEM_ACTIVE_DB = -40.0      # speech stem counts as active above this level
 STEM_ACTIVE_FRACTION = 0.5  # share of a block the stem must be active for speech
 FRAME_MS = 20
 MEDIAN_BLOCKS = 31          # smoothing window in blocks (about 30 s at 1 s blocks)
+SERMON_MIN_S = 300.0        # speech runs at least this long are a sermon, placeholder
 
 
 def _frame_db(x, sr):
@@ -33,37 +37,38 @@ def _frame_db(x, sr):
     return 20 * np.log10(np.sqrt((frames ** 2).mean(axis=1)) + 1e-12)
 
 
+def mixdown_block_label(seg, sr):
+    """Label one block of the mono mixdown: -1 silence, 0 music, 1 speech."""
+    level_db = 10 * np.log10((seg ** 2).mean() + 1e-18)
+    if level_db < SILENCE_DB:
+        return -1
+    env = _frame_db(seg, sr)
+    env = env[env > -70.0]  # drop near-silent frames but keep speech pauses
+    spread_db = float(np.percentile(env, 90) - np.percentile(env, 10)) if env.size > 1 else 0.0
+    spec = np.abs(np.fft.rfft(seg)) ** 2
+    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+    total = spec[freqs >= 40].sum() + 1e-18
+    mid = spec[(freqs >= 300) & (freqs < 3000)].sum() / total
+    is_speech = spread_db > SPEECH_SPREAD_DB and mid > SPEECH_MID_FRACTION
+    return 1 if is_speech else 0
+
+
+def stem_block_label(seg, sr):
+    """Label one block of the speech stem: 1 when the stem is active enough, else 0."""
+    env = _frame_db(seg, sr)
+    active = (env > STEM_ACTIVE_DB).mean() if env.size else 0.0
+    return 1 if active > STEM_ACTIVE_FRACTION else 0
+
+
 def _mixdown_labels(mono, sr, block):
-    labels = []
-    for i in range(0, len(mono) - block + 1, block):
-        seg = mono[i:i + block]
-        level_db = 10 * np.log10((seg ** 2).mean() + 1e-18)
-        if level_db < SILENCE_DB:
-            labels.append(-1)
-            continue
-        env = _frame_db(seg, sr)
-        env = env[env > -70.0]  # drop near-silent frames but keep speech pauses
-        spread_db = float(np.percentile(env, 90) - np.percentile(env, 10)) if env.size > 1 else 0.0
-        spec = np.abs(np.fft.rfft(seg)) ** 2
-        freqs = np.fft.rfftfreq(len(seg), 1 / sr)
-        total = spec[freqs >= 40].sum() + 1e-18
-        mid = spec[(freqs >= 300) & (freqs < 3000)].sum() / total
-        is_speech = spread_db > SPEECH_SPREAD_DB and mid > SPEECH_MID_FRACTION
-        labels.append(1 if is_speech else 0)
-    return labels
+    return [mixdown_block_label(mono[i:i + block], sr) for i in range(0, len(mono) - block + 1, block)]
 
 
 def _stem_labels(stem, sr, block, n_blocks):
-    labels = []
-    for i in range(n_blocks):
-        seg = stem[i * block:(i + 1) * block]
-        env = _frame_db(seg, sr)
-        active = (env > STEM_ACTIVE_DB).mean() if env.size else 0.0
-        labels.append(1 if active > STEM_ACTIVE_FRACTION else 0)
-    return labels
+    return [stem_block_label(stem[i * block:(i + 1) * block], sr) for i in range(n_blocks)]
 
 
-def _fill_silence(labels):
+def fill_silence(labels):
     """Silent blocks take the label of the block before them (or the first real label)."""
     first = next((v for v in labels if v >= 0), 0)
     out, last = [], first
@@ -110,32 +115,18 @@ def _merge_short(runs, min_len_s):
     return runs
 
 
-SERMON_MIN_S = 300.0        # speech runs at least this long are a sermon, placeholder
-
-
 def _speech_kind(duration_s, sermon_min_s):
     return "sermon" if duration_s >= sermon_min_s else "announcements"
 
 
-def detect(mono, sr, speech_audio=None, block_s=1.0, min_len_s=60.0, sermon_min_s=SERMON_MIN_S):
-    """Return a list of spans: {name, type, start_s, end_s}. Empty if there is too little audio.
+def spans_from_labels(labels, block_s=1.0, min_len_s=60.0, sermon_min_s=SERMON_MIN_S):
+    """Turn per-block labels (0 music, 1 speech, no silence) into named spans.
 
     Music runs are "worship". Speech runs are "sermon" when long enough, otherwise
     "announcements" (welcome, notices, prayer and similar short talk).
     """
-    mono = np.asarray(mono, dtype=np.float64)
-    block = int(sr * block_s)
-    n_blocks = len(mono) // block
-    if n_blocks == 0:
+    if len(labels) == 0:
         return []
-
-    if speech_audio is not None:
-        stem = np.asarray(speech_audio, dtype=np.float64)
-        stem = np.pad(stem, (0, max(0, len(mono) - len(stem))))[:len(mono)]
-        labels = _stem_labels(stem, sr, block, n_blocks)
-    else:
-        labels = _fill_silence(_mixdown_labels(mono, sr, block))
-
     smoothed = median_filter(np.array(labels), size=MEDIAN_BLOCKS, mode="nearest").tolist()
     runs = _merge_short(_runs(smoothed, block_s), min_len_s)
 
@@ -154,6 +145,24 @@ def detect(mono, sr, speech_audio=None, block_s=1.0, min_len_s=60.0, sermon_min_
             "end_s": round(r["end_s"], 1),
         })
     return spans
+
+
+def detect(mono, sr, speech_audio=None, block_s=1.0, min_len_s=60.0, sermon_min_s=SERMON_MIN_S):
+    """Return a list of spans: {name, type, start_s, end_s}. Empty if there is too little audio."""
+    mono = np.asarray(mono, dtype=np.float64)
+    block = int(sr * block_s)
+    n_blocks = len(mono) // block
+    if n_blocks == 0:
+        return []
+
+    if speech_audio is not None:
+        stem = np.asarray(speech_audio, dtype=np.float64)
+        stem = np.pad(stem, (0, max(0, len(mono) - len(stem))))[:len(mono)]
+        labels = _stem_labels(stem, sr, block, n_blocks)
+    else:
+        labels = fill_silence(_mixdown_labels(mono, sr, block))
+
+    return spans_from_labels(labels, block_s, min_len_s, sermon_min_s)
 
 
 def combine_markers(detected, markers, total_s):

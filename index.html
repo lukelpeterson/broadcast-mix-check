@@ -50,7 +50,7 @@
   <h1>Broadcast Mix Check</h1>
   <p class="lede">Drop in a Sunday recording and get the sections, measurements and notes for next week. The file is read in your browser and never uploaded.</p>
 
-  <div class="placeholder">Test version. Targets are placeholders until Matt's annotated recordings set them. Start with a short clip; a very long file may run out of memory in the browser.</div>
+  <div class="placeholder">Test version. Targets are placeholders until Matt's annotated recordings set them. A full Sunday recording takes a few minutes; the progress line shows how far along it is.</div>
 
   <section class="card">
     <h2>1. Recording</h2>
@@ -118,14 +118,25 @@ function workerMain() {
     try {
       const py = await loadEngine(msg.baseUrl);
       if (msg.type === "warm") return;
-      say("measure", "Measuring sections and loudness (this can take a few minutes for a long recording)");
-      py.FS.writeFile("/tmp/l.f32", new Uint8Array(msg.left));
-      py.FS.writeFile("/tmp/r.f32", new Uint8Array(msg.right));
-      const progress = (text) => say("measure", text);
-      const result = JSON.parse(py.pyimport("browser_entry").run("/tmp/l.f32", "/tmp/r.f32", msg.sampleRate, progress));
-      py.FS.unlink("/tmp/l.f32");
-      py.FS.unlink("/tmp/r.f32");
-      postMessage({ type: "result", report: result.report, markdown: result.markdown });
+      const engine = py.pyimport("browser_entry");
+      if (msg.type === "start") {
+        engine.start(msg.sampleRate);
+        return postMessage({ type: "ack" });
+      }
+      if (msg.type === "chunk") {
+        // One chunk at a time: each is written, measured, and deleted, so memory stays small.
+        py.FS.writeFile("/tmp/l.f32", new Uint8Array(msg.left));
+        py.FS.writeFile("/tmp/r.f32", new Uint8Array(msg.right));
+        const seconds = engine.feed("/tmp/l.f32", "/tmp/r.f32");
+        py.FS.unlink("/tmp/l.f32");
+        py.FS.unlink("/tmp/r.f32");
+        return postMessage({ type: "ack", seconds });
+      }
+      if (msg.type === "finish") {
+        say("measure", "Finding sections and writing notes");
+        const result = JSON.parse(engine.finish());
+        return postMessage({ type: "ack", result });
+      }
     } catch (err) {
       postMessage({ type: "error", message: String(err && (err.message || err)).trim().slice(-2000) });
     }
@@ -175,28 +186,38 @@ function fail(message) {
   $("engineBadge").textContent = "";
 }
 
+// Each message to the worker gets one reply ("ack"). ask() waits for it, so chunks are sent one at a time.
+let waiter = null;
+function ask(message, transfer = []) {
+  return new Promise((resolve, reject) => {
+    waiter = { resolve, reject };
+    worker.postMessage(message, transfer);
+  });
+}
+
 worker.onmessage = (e) => {
   const msg = e.data;
   if (msg.type === "step") setStep(msg.id, "active", msg.text);
   if (msg.type === "stepDone") { setStep("engine", "done", "Ready"); $("engineBadge").textContent = ""; }
-  if (msg.type === "result") {
-    setStep("measure", "done", "Finished");
-    setStep("read", "done", state.read && state.read.text);
-    if (ticker) { clearInterval(ticker); ticker = null; }
-    render(msg.report, msg.markdown);
+  if (msg.type === "ack" && waiter) { const w = waiter; waiter = null; w.resolve(msg); }
+  if (msg.type === "error") {
+    fail(msg.message);
+    if (waiter) { const w = waiter; waiter = null; w.reject(new Error(msg.message)); }
   }
-  if (msg.type === "error") fail(msg.message);
 };
-worker.onerror = (e) => fail(e.message || "The analysis engine stopped unexpectedly.");
+worker.onerror = (e) => {
+  const message = e.message || "The analysis engine stopped unexpectedly.";
+  fail(message);
+  if (waiter) { const w = waiter; waiter = null; w.reject(new Error(message)); }
+};
 
 
 async function decodeToStereo(file) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
   try {
+    // Keep the decoded buffer as it is. Its channels are sent to the engine in small pieces.
     const buffer = await ctx.decodeAudioData(await file.arrayBuffer());
-    const left = buffer.getChannelData(0);
-    const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
-    return { left: left.slice().buffer, right: right.slice().buffer, sampleRate: buffer.sampleRate, seconds: buffer.duration };
+    return { buffer, sampleRate: buffer.sampleRate, seconds: buffer.duration };
   } finally {
     ctx.close();
   }
@@ -239,14 +260,45 @@ async function analyze(file) {
     setStep("engine", "active", "Loading the analysis engine (about 20 seconds the first time)");
   }
   setStep("read", "active", "Decoding the audio");
+  let decoded;
   try {
-    const { left, right, sampleRate, seconds } = await decodeToStereo(file);
-    setStep("read", "done", `${mmss(seconds)} of audio read`);
-    setStep("measure", "active", "Starting the check");
-    worker.postMessage({ type: "analyze", baseUrl: BASE_URL, left, right, sampleRate }, [left, right]);
+    decoded = await decodeToStereo(file);
   } catch (err) {
-    fail(`The browser could not decode this file (${err.message || err}).`);
+    return fail(`The browser could not decode this file (${err.message || err}).`);
   }
+  setStep("read", "done", `${mmss(decoded.seconds)} of audio read`);
+  try {
+    await measure(decoded);
+  } catch (err) {
+    fail(err.message || String(err));
+  }
+}
+
+// Sends the audio to the engine 30 seconds at a time, waiting for each piece to be measured.
+async function measure({ buffer, sampleRate, seconds }) {
+  const left = buffer.getChannelData(0);
+  const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
+  const total = left.length;
+  const piece = sampleRate * 30;
+  setStep("measure", "active", `Measuring the audio: 0:00 of ${mmss(seconds)} (0%)`);
+  await ask({ type: "start", baseUrl: BASE_URL, sampleRate });
+  for (let i = 0; i < total; i += piece) {
+    const l = left.slice(i, i + piece).buffer;
+    const r = right.slice(i, i + piece).buffer;
+    const reply = await ask({ type: "chunk", left: l, right: r }, [l, r]);
+    const done = Math.min(i + piece, total);
+    const pct = Math.round((100 * done) / total);
+    const text = done < total
+      ? `Measuring the audio: ${mmss(done / sampleRate)} of ${mmss(seconds)} (${pct}%)`
+      : `Measured all ${mmss(seconds)} of audio`;
+    setStep("measure", "active", text);
+  }
+  setStep("measure", "active", "Finding sections and writing notes");
+  const reply = await ask({ type: "finish" });
+  if (ticker) { clearInterval(ticker); ticker = null; }
+  setStep("measure", "done", "Finished");
+  setStep("read", "done", `${mmss(seconds)} of audio read`);
+  render(reply.result.report, reply.result.markdown);
 }
 
 const drop = $("drop");
