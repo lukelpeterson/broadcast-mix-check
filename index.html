@@ -54,6 +54,9 @@
 
   /* waveform and section editor */
   .wave { width:100%; height:150px; display:block; border-radius:12px; background:var(--soft); touch-action:none; }
+  .player { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:10px; }
+  .clock { font-variant-numeric:tabular-nums; color:var(--muted); font-size:14px; }
+  button.play { margin-left:auto; padding:5px 12px; font-size:13px; }
   .sec { border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:12px; background:var(--card); }
   .sec-head, .sec-times { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
   .sec-head .name { font-weight:650; font-size:16px; border:1px solid transparent; background:transparent; min-width:200px; }
@@ -107,6 +110,11 @@
 
   <section id="results" class="card hidden">
     <h2>2. Sections and notes</h2>
+    <div class="player">
+      <button id="playBtn" class="primary">▶ Play</button>
+      <span id="clock" class="clock">0:00 / 0:00</span>
+      <span class="hint" style="margin:0">Click the waveform to jump there.</span>
+    </div>
     <canvas id="wave" class="wave" aria-label="Waveform. Drag a boundary line to move it."></canvas>
     <div class="hint">Drag a boundary line on the waveform, or type times below. Measurements update when you let go.</div>
     <div id="busy" class="hint"></div>
@@ -123,7 +131,7 @@
 /* ---------- Background worker: loads Python and runs the check, so the page stays responsive ---------- */
 function workerMain() {
   const PYODIDE_VERSION = "0.26.4";
-  const BUILD = "2026-11-07-7";   // bump with each release so browsers fetch fresh engine files
+  const BUILD = "2026-11-07-8";   // bump with each release so browsers fetch fresh engine files
   const PY_FILES = [
     "py/browser_entry.py",
     "py/automix/__init__.py", "py/automix/check.py", "py/automix/sections.py", "py/automix/reference_profiles.yaml",
@@ -373,6 +381,11 @@ function drawWave() {
   g.fillText("0:00", 6, h - 6);
   g.textAlign = "right";
   g.fillText(mmss(total), w - 6, h - 6);
+  if (currentBuffer) {
+    const x = (position() / total) * w;
+    g.fillStyle = cssVar("--ink");
+    g.fillRect(x - 1, 0, 2, h);
+  }
   g.textAlign = "left";
 }
 
@@ -393,9 +406,10 @@ function timeAt(clientX) {
   return Math.min(1, Math.max(0, (clientX - r.left) / r.width)) * model.total;
 }
 
+let clickStartX = null;
 $("wave").addEventListener("pointerdown", (e) => {
   const i = nearestBoundary(e.clientX);
-  if (i < 0) return;
+  if (i < 0) { clickStartX = e.clientX; return; }
   dragIndex = i;
   $("wave").setPointerCapture(e.pointerId);
 });
@@ -417,7 +431,11 @@ function endDrag() {
   renderEditor();
   scheduleRelabel();
 }
-$("wave").addEventListener("pointerup", endDrag);
+$("wave").addEventListener("pointerup", (e) => {
+  if (dragIndex === null && clickStartX !== null && Math.abs(e.clientX - clickStartX) < 5) seekTo(timeAt(e.clientX));
+  clickStartX = null;
+  endDrag();
+});
 $("wave").addEventListener("pointercancel", endDrag);
 
 /* ---------- Section editor ---------- */
@@ -453,6 +471,7 @@ function renderEditor() {
       <div class="sec-times" style="margin-top:10px">
         <label>Start <input class="start" data-i="${i}" value="${mmss(s.start)}" ${i === 0 ? "disabled" : ""}></label>
         <label>End <input class="end" data-i="${i}" value="${mmss(s.end)}" ${last ? "disabled" : ""}></label>
+        <button class="play" data-i="${i}" title="Play this section">▶ Play section</button>
       </div>
       ${noteBox(s.name)}
     </div>`;
@@ -511,6 +530,11 @@ document.addEventListener("input", (e) => {
   if (e.target.classList && e.target.classList.contains("note-text")) userNotes.set(e.target.dataset.key, e.target.value);
 });
 document.addEventListener("click", (e) => {
+  if (e.target.classList && e.target.classList.contains("play") && model) {
+    const sec = model.sections[Number(e.target.dataset.i)];
+    play(sec.start, sec.end);
+    return;
+  }
   if (e.target.classList && e.target.classList.contains("reset")) {
     userNotes.delete(e.target.dataset.key);
     renderEditor();
@@ -565,6 +589,89 @@ function applyReport(report, first) {
   renderEditor();
 }
 
+/* ---------- Playback ---------- */
+let currentBuffer = null;     // the decoded audio, kept once measuring has finished
+let audioCtx = null, source = null, playing = false;
+let playOffset = 0, playStartedAt = 0;
+let frameId = null;
+
+function duration() { return currentBuffer ? currentBuffer.duration : totalSeconds; }
+function position() {
+  if (!playing || !audioCtx) return playOffset;
+  return Math.min(duration(), playOffset + (audioCtx.currentTime - playStartedAt));
+}
+
+function updateControls() {
+  $("playBtn").textContent = playing ? "❚❚ Pause" : "▶ Play";
+  $("clock").textContent = `${mmss(position())} / ${mmss(duration())}`;
+}
+
+function stopSource() {
+  if (source) { const s = source; source = null; try { s.stop(); } catch (err) { /* already stopped */ } }
+}
+
+function animate() {
+  cancelAnimationFrame(frameId);
+  const tick = () => {
+    drawWave();
+    updateControls();
+    frameId = playing ? requestAnimationFrame(tick) : null;
+  };
+  tick();
+}
+
+// Plays from a time, stopping at "until" if given (used for a single section).
+function play(from, until = null) {
+  if (!currentBuffer) return;
+  stopSource();
+  if (!audioCtx) audioCtx = new AudioContext({ sampleRate: 48000 });
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  const src = audioCtx.createBufferSource();
+  src.buffer = currentBuffer;
+  src.connect(audioCtx.destination);
+  src.onended = () => {
+    if (source !== src) return;            // stopped on purpose, not at the end
+    source = null; playing = false; playOffset = 0;
+    animate();
+  };
+  const start = Math.max(0, Math.min(from, duration()));
+  if (until !== null) src.start(0, start, Math.max(0.05, until - start));
+  else src.start(0, start);
+  source = src;
+  playing = true;
+  playOffset = start;
+  playStartedAt = audioCtx.currentTime;
+  animate();
+}
+
+function pause() {
+  if (!playing) return;
+  playOffset = position();
+  playing = false;
+  stopSource();
+  animate();
+}
+
+function stopPlayback() {
+  stopSource();
+  playing = false;
+  playOffset = 0;
+  if (frameId) cancelAnimationFrame(frameId);
+  frameId = null;
+}
+
+function seekTo(t) {
+  if (!currentBuffer) return;
+  if (playing) play(t);
+  else { playOffset = Math.max(0, Math.min(t, duration())); animate(); }
+}
+
+$("playBtn").addEventListener("click", () => {
+  if (!currentBuffer) return;
+  if (playing) pause();
+  else play(playOffset >= duration() - 0.05 ? 0 : playOffset);
+});
+
 /* ---------- Run ---------- */
 async function measure({ buffer, sampleRate, seconds }) {
   const left = buffer.getChannelData(0);
@@ -591,6 +698,7 @@ async function measure({ buffer, sampleRate, seconds }) {
   setStep("read", "done", `${mmss(seconds)} of audio read`);
   // The waveform and editor appear only once measuring has finished.
   peaks = computePeaks(buffer);
+  currentBuffer = buffer;
   $("results").classList.remove("hidden");
   applyReport(reply.result.report, true);
   setBusy("Drag a boundary or edit the times to re-measure.");
@@ -600,6 +708,8 @@ async function analyze(file) {
   $("errorBox").classList.remove("show");
   $("results").classList.add("hidden");
   for (const s of STEPS) if (s.id !== "engine") delete state[s.id];
+  stopPlayback();
+  currentBuffer = null;
   model = null;
   peaks = null;
   userNotes.clear();
