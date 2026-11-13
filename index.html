@@ -42,6 +42,12 @@
   .hint { font-size:13px; color:var(--muted); margin-top:8px; }
   .note-text { font:inherit; font-size:14px; }
   .console { font-size:13px; color:var(--link); margin-top:4px; }
+  .note { border-left:4px solid var(--accent); padding:10px 14px; margin:10px 0; background:var(--soft); border-radius:0 8px 8px 0; }
+  .note .where { font-weight:600; font-size:13px; color:var(--muted); }
+  .note .console { margin-top:6px; font-size:14px; }
+  .note .console span { color:var(--accent); font-weight:600; }
+  .ok { color:var(--muted); }
+  details summary { cursor:pointer; margin:18px 0 8px; }
   input, select { font:inherit; font-size:14px; padding:5px 8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); }
   input:disabled { opacity:.55; }
   button { font:inherit; padding:9px 16px; border-radius:999px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; transition:background .15s; }
@@ -110,7 +116,11 @@
   </section>
 
   <section id="results" class="card hidden">
-    <h2>2. Sections and notes</h2>
+    <h2>2. What to change</h2>
+    <p class="hint">Set these once before the service. No one needs to ride faders during it.</p>
+    <div id="moves"></div>
+
+    <h2 style="margin-top:22px">3. Sections and notes</h2>
     <div class="player">
       <button id="playBtn" class="primary">▶ Play</button>
       <span id="clock" class="clock">0:00 / 0:00</span>
@@ -119,11 +129,14 @@
     <canvas id="wave" class="wave" aria-label="Waveform. Drag a boundary line to move it."></canvas>
     <div class="hint">Drag a boundary line on the waveform, or type times below. Measurements update when you let go.</div>
     <div id="busy" class="hint"></div>
-    <div id="sections"></div>
-    <div id="transitionsWrap" class="hidden">
-      <h2 style="margin-top:18px">Between sections</h2>
-      <div id="transitions"></div>
-    </div>
+    <details id="details">
+      <summary><strong>Show details</strong></summary>
+      <div id="sections"></div>
+      <div id="transitionsWrap" class="hidden">
+        <h2 style="margin-top:18px">Between sections</h2>
+        <div id="transitions"></div>
+      </div>
+    </details>
     <div style="margin-top:14px"><button id="copy" class="primary">Copy report (Markdown)</button> <span id="copied" class="hint"></span></div>
   </section>
 </main>
@@ -132,7 +145,7 @@
 /* ---------- Background worker: loads Python and runs the check, so the page stays responsive ---------- */
 function workerMain() {
   const PYODIDE_VERSION = "0.26.4";
-  const BUILD = "2026-11-07-9";   // bump with each release so browsers fetch fresh engine files
+  const BUILD = "2026-11-13-1";   // bump with each release so browsers fetch fresh engine files
   const PY_FILES = [
     "py/browser_entry.py",
     "py/automix/__init__.py", "py/automix/check.py", "py/automix/sections.py", "py/automix/reference_profiles.yaml",
@@ -213,6 +226,7 @@ const state = {};          // id -> { status, text, startedAt }
 let ticker = null;
 let currentFileName = "recording";
 let totalSeconds = 0;
+let lastMoves = [];               // the "What to change" moves from the latest report
 
 // Editor state. model.sections holds what the user sees and edits; the notes maps hold
 // the automatic notes from the last measurement and anything the user typed over them.
@@ -561,7 +575,24 @@ async function runRelabel() {
   }
 }
 
+function renderMoves(list) {
+  lastMoves = list;
+  const box = $("moves");
+  box.innerHTML = "";
+  if (!list.length) { box.innerHTML = `<p class="ok">Nothing to change against the current targets.</p>`; return; }
+  list.forEach((m, i) => {
+    const div = document.createElement("div");
+    div.className = "note";
+    div.innerHTML = `<div class="where"></div><div></div>${m.why ? `<div class="console"><span>Why:</span> </div>` : ""}`;
+    div.children[0].textContent = `${i + 1}. ${m.title}`;
+    div.children[1].textContent = m.action;
+    if (m.why) div.querySelector(".console").append(m.why);
+    box.appendChild(div);
+  });
+}
+
 function applyReport(report, first) {
+  renderMoves(report.moves || []);
   if (first) {
     model = {
       total: totalSeconds,
@@ -838,7 +869,10 @@ window.addEventListener("resize", () => drawWave());
 function buildMarkdown() {
   if (!model) return "";
   const flat = (t) => String(t).replace(/\s*\n\s*/g, " ").trim();
-  const lines = [`# Broadcast Mix Check: ${currentFileName}`, "", "## Sections", ""];
+  const lines = [`# Broadcast Mix Check: ${currentFileName}`, "", "## What to change", ""];
+  lastMoves.forEach((m, i) => lines.push(`${i + 1}. **${m.title}:** ${flat(m.action)}${m.why ? ` Why: ${flat(m.why)}` : ""}`));
+  if (!lastMoves.length) lines.push("Nothing to change against the current targets.");
+  lines.push("", "## Sections", "");
   for (const s of model.sections) {
     const m = s.metrics || {};
     const lufs = m.integrated_lufs != null ? `${m.integrated_lufs} LUFS` : "too short to measure";
