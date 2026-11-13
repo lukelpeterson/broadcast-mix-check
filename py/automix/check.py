@@ -347,6 +347,8 @@ class StreamAnalyzer:
             })
         overall = self._lufs(0, total_s) if total_s else None
         notes = find_issues(sections, ref, overall_lufs=overall)
+        moves = general_moves(sections, notes, ref)
+        notes = link_notes(sections, notes, moves, ref)
         return {
             "file": file_name,
             "sample_rate": self.sr,
@@ -354,9 +356,10 @@ class StreamAnalyzer:
             "character": ref["character"],
             "overall_lufs": None if overall is None else round(overall, 1),
             "sections": sections,
+            "moves": moves,
             "top_fixes": top_fixes(notes),
             "notes": notes,
-            "section_notes": group_notes(notes),
+            "section_notes": group_notes(notes, moves),
         }
 
 
@@ -404,6 +407,8 @@ def _category(ref, kind):
     return ref["section_types"].get(kind, "worship")
 
 
+SPEECH_COMPRESSOR = ("Put a gentle compressor on the pastor's mic for the stream (about 3:1, slow release, 3-6 dB of "
+                     "gain reduction on normal speech) so quiet moments come up without anyone riding the fader.")
 SPEECH_UP = "Bring the pastor's mic up on the stream mix."
 SPEECH_DOWN = "Bring the pastor's mic down on the stream mix."
 VIDEO_UP = "Bring the video playback channel up on the stream mix."
@@ -481,7 +486,7 @@ def find_issues(sections, ref, overall_lufs=None):
                 name, "sermon_fade",
                 f"{where} drops {s['fade_db']:.1f} dB from its first {win} to its last {win}. "
                 "Messages often start high-energy and end quieter, and the stream needs to follow.",
-                "Ride the pastor's mic up as the message gets quieter, or add a slow leveler on the stream bus.",
+                SPEECH_COMPRESSOR,
             ))
 
         # Spectral balance of speech
@@ -604,7 +609,7 @@ def find_issues(sections, ref, overall_lufs=None):
             notes.append(_note(
                 label, "section_jump",
                 f"At {when}, the level jumps {abs(jump):.1f} dB from {prev['name']} to {nxt['name']}. Viewers will reach for the volume.",
-                "Set a level change at the transition on the stream bus, or ease the bus compressor so both sections sit closer.",
+                "If this happens every week, even it out with gentle compression on the stream bus instead of riding faders.",
                 time_s=nxt["start_s"],
             ))
     return notes
@@ -626,18 +631,22 @@ def top_fixes(notes, limit=3):
     return fixes
 
 
-def group_notes(notes):
-    """One note per section: its issues joined into a single paragraph, with repeated console tips merged."""
+def group_notes(notes, moves=None):
+    """One note per section: its issues joined into a single paragraph, with repeated console tips merged
+    and the moves that already cover it named in one sentence."""
     grouped = {}
     for n in notes:
-        g = grouped.setdefault(n["section"], {"messages": [], "consoles": []})
+        g = grouped.setdefault(n["section"], {"messages": [], "consoles": [], "covered": []})
         g["messages"].append(n["message"])
-        if n["console"] and n["console"] not in g["consoles"]:
+        if moves and n.get("covered_by") and n["console"] == _covered_text(moves, n["covered_by"]):
+            g["covered"] += n["covered_by"]           # pooled below into one sentence
+        elif n["console"] and n["console"] not in g["consoles"]:
             g["consoles"].append(n["console"])
-    return [
-        {"section": name, "message": " ".join(g["messages"]), "console": " ".join(g["consoles"]) or None}
-        for name, g in grouped.items()
-    ]
+    out = []
+    for name, g in grouped.items():
+        consoles = ([_covered_text(moves, g["covered"])] if g["covered"] else []) + g["consoles"]
+        out.append({"section": name, "message": " ".join(g["messages"]), "console": " ".join(consoles) or None})
+    return out
 
 
 def _tell(progress, text):
@@ -679,22 +688,265 @@ def analyze(path, sections_spec=None, reference=None, sr=48000, speech_path=None
                           file_name=Path(path).name, setup=setup, character=character)
 
 
+def _wmedian(values, weights):
+    order = np.argsort(values)
+    v, w = np.asarray(values, float)[order], np.asarray(weights, float)[order]
+    return float(v[np.searchsorted(np.cumsum(w), w.sum() / 2)])
+
+
+def general_moves(sections, notes, ref, limit=5):
+    """Tier 1: turn the per-section measurements into a few set-and-forget moves for a volunteer.
+
+    Most churches have no dedicated broadcast engineer to ride faders during the service, so every
+    move is a setting made once: one overall level, one pastor-mic offset, one compressor, one tone
+    fix, one width fix. A move only appears when it holds for most of the service.
+    """
+    checks = ref["checks"]
+    setup = ref["setups"][ref["setup"]]
+    targets = {"worship": setup["worship_lufs"], SPEECH_CATEGORY: setup["speech_lufs"]}
+    ceiling = checks["true_peak_ceiling_dbtp"]
+    tol = checks["loudness_tolerance_lu"]
+    dur = lambda s: s["end_s"] - s["start_s"]
+    cat = lambda s: _category(ref, s["type"])
+    measured = [s for s in sections if s["integrated_lufs"] is not None]
+    worship = [s for s in measured if cat(s) == "worship"]
+    speech = [s for s in measured if cat(s) == SPEECH_CATEGORY and s["type"] != "video"]
+    moves = []
+
+    # 1. Overall level, from worship (or speech when there is no worship)
+    base = worship or speech
+    gain = 0.0
+    max_tp = max((s["true_peak_dbtp"] for s in sections), default=-120.0)
+    limiter_added = False
+    if base:
+        gain = _wmedian([targets[cat(s)] - s["integrated_lufs"] for s in base], [dur(s) for s in base])
+        if abs(gain) > tol:
+            up = gain > 0
+            amount = round(abs(gain))
+            action = f"Bring your whole stream {'up' if up else 'down'} about {amount} dB"
+            if up and max_tp + gain > ceiling:
+                action += (f", and add a limiter at the very end of the stream bus set to {ceiling} dBTP "
+                           "so the louder moments don't clip")
+                limiter_added = True
+            kind = "worship" if worship else "speech"
+            why = (f"Your {kind} sits about {amount} dB {'under' if up else 'over'} its {targets[kind]} LUFS target for most of the service."
+                   + (" YouTube turns loud streams down but never turns quiet ones up." if up else ""))
+            moves.append({"move": "overall_level", "title": "Overall level", "action": action + ".", "why": why,
+                          "db": round(gain, 1)})
+        else:
+            gain = 0.0
+    if not limiter_added and max_tp > ceiling:
+        moves.append({"move": "limiter", "title": "Peaks", "action":
+                      f"Add a limiter at the very end of the stream bus set to {ceiling} dBTP.",
+                      "why": f"Peaks reach {max_tp} dBTP, which some streaming encoders turn into clicks and distortion."})
+
+    # 2. Pastor's mic against worship: one offset for the whole service
+    gap = checks["worship_speech_gap_db"]
+    wants = []
+    for prev, nxt in zip(sections, sections[1:]):
+        if prev.get("end_lufs") is None or nxt.get("start_lufs") is None:
+            continue
+        if cat(prev) == "worship" and cat(nxt) == SPEECH_CATEGORY and nxt["type"] != "video":
+            wants.append((prev["end_lufs"] - gap) - nxt["start_lufs"])
+        elif cat(prev) == SPEECH_CATEGORY and prev["type"] != "video" and cat(nxt) == "worship":
+            wants.append((nxt["start_lufs"] - gap) - prev["end_lufs"])
+    if wants:
+        shift = float(np.median(wants))
+    elif speech:
+        shift = _wmedian([targets[SPEECH_CATEGORY] - s["integrated_lufs"] for s in speech], [dur(s) for s in speech]) - gain
+    else:
+        shift = 0.0
+    if abs(shift) > checks["gap_tolerance_db"]:
+        amount = round(abs(shift))
+        moves.append({"move": "speech_balance", "title": "Pastor's mic vs. worship", "action":
+                      f"Set the pastor's mic about {amount} dB {'higher' if shift > 0 else 'lower'} on the stream mix, "
+                      "and leave it there for the whole service.",
+                      "why": f"Speech should sit about {gap} dB under worship. Right now it comes in about {amount} dB "
+                             f"{'quieter' if shift > 0 else 'louder'} than that, so viewers "
+                             f"{'strain to hear the message' if shift > 0 else 'hear it louder than the worship vocal'}.",
+                      "db": round(shift, 1)})
+
+    # 2b. Video playback against worship: one offset, same idea as the pastor's mic
+    vwants = []
+    for prev, nxt in zip(sections, sections[1:]):
+        if prev.get("end_lufs") is None or nxt.get("start_lufs") is None:
+            continue
+        if cat(prev) == "worship" and nxt["type"] == "video":
+            vwants.append((prev["end_lufs"] - gap) - nxt["start_lufs"])
+        elif prev["type"] == "video" and cat(nxt) == "worship":
+            vwants.append((nxt["start_lufs"] - gap) - prev["end_lufs"])
+    vshift = float(np.median(vwants)) if vwants else 0.0
+    if abs(vshift) > checks["gap_tolerance_db"]:
+        amount = round(abs(vshift))
+        moves.append({"move": "video_balance", "title": "Video playback vs. worship", "action":
+                      f"Set the video playback channel about {amount} dB {'higher' if vshift > 0 else 'lower'} on the "
+                      "stream mix, and leave it there.",
+                      "why": f"Videos should sit about {gap} dB under worship, like speech. Right now they come in about "
+                             f"{amount} dB {'quieter' if vshift > 0 else 'louder'} than that.",
+                      "db": round(vshift, 1)})
+
+    # 3. Speech consistency
+    fades = [n for n in notes if n["issue"] == "sermon_fade"]
+    long_speech = [s for s in speech if dur(s) >= checks["min_check_length_s"]]
+    spread = (max(s["integrated_lufs"] for s in long_speech) - min(s["integrated_lufs"] for s in long_speech)) if len(long_speech) > 1 else 0
+    if fades or spread > 2 * tol:
+        moves.append({"move": "speech_consistency", "title": "Steady speech", "action": SPEECH_COMPRESSOR,
+                      "why": "The speech level drifts during the service" + (" and the message fades toward the end." if fades else ".")})
+
+    # 4 and 5. Tone, then space and width: only when true for most of the worship time
+    names = {s["name"]: s for s in sections}
+    total = sum(dur(s) for s in worship if dur(s) >= checks["min_check_length_s"])
+    def share(pred):
+        hit = {n["section"] for n in notes if n["section"] in names and pred(n)}
+        return sum(dur(names[h]) for h in hit) / total if total else 0.0
+    dark = share(lambda n: n["issue"] == "low_mid_buildup" or (n["issue"] == "tilt" and "darker" in n["message"]))
+    bright = share(lambda n: n["issue"] == "tilt" and "brighter" in n["message"])
+    harsh = share(lambda n: n["issue"] == "upper_mid_harshness" and cat(names[n["section"]]) == "worship")
+    tone = max([("dark", dark), ("bright", bright), ("harsh", harsh)], key=lambda t: t[1])
+    if tone[1] >= 0.5:
+        moves.append({"move": "tone", "title": "Tone", "tone": tone[0], **{
+            "dark": {"action": "Clean up the low end: high-pass every channel except kick and bass around 80-100 Hz, "
+                               "and take 2-3 dB out around 250-400 Hz on keys and acoustic guitar.",
+                     "why": "Most of the worship sounds heavy or muddy on phones and laptops."},
+            "bright": {"action": "Add some weight: bring kick and bass up a couple of dB on the stream mix, and soften "
+                                 "cymbals and vocals above 3 kHz.",
+                       "why": "Most of the worship sounds thin or bright."},
+            "harsh": {"action": "Find the 2-4 kHz peak on the vocal and cymbal channels and take 2-3 dB out.",
+                      "why": "Most of the worship has a harsh, fatiguing edge."}}[tone[0]]})
+    width = max([("mono_loss", share(lambda n: n["issue"] == "mono_loss")),
+                 ("narrow", share(lambda n: n["issue"] == "narrow")),
+                 ("space", share(lambda n: n["issue"] == "space"))], key=lambda t: t[1])
+    if width[1] >= 0.5:
+        moves.append({"move": width[0], "title": "Space and width", **{
+            "mono_loss": {"action": "Check for out-of-phase stereo sources (wide reverbs, stereo keys, flipped mics), "
+                                    "and keep the vocal centered.",
+                          "why": "Parts of the mix cancel out on phones, which play in mono."},
+            "narrow": {"action": "Spread instruments across the stereo field, and bring up audience mics if you have them.",
+                       "why": "The stream is close to mono, so it sounds small next to other services online."},
+            "space": {"action": "Ease the compression or limiting on the stream bus so the band can breathe.",
+                      "why": "The worship sounds squashed, with little space around each instrument."}}[width[0]]})
+    return moves[:limit]
+
+
+TONE_ISSUES = {"dark": {"low_mid_buildup", "tilt"}, "bright": {"tilt"}, "harsh": {"upper_mid_harshness"}}
+WIDTH_ISSUES = {"mono_loss", "narrow", "space"}
+
+
+def _covered_text(moves, nums):
+    nums = sorted(set(nums))
+    titles = ", ".join(moves[i - 1]["title"].lower() for i in nums)
+    if len(nums) == 1:
+        return f"Move {nums[0]} above ({titles}) takes care of this."
+    listed = ", ".join(str(i) for i in nums[:-1]) + f" and {nums[-1]}"
+    return f"Moves {listed} above ({titles}) take care of this."
+
+
+def link_notes(sections, notes, moves, ref):
+    """Point each detailed note at the move that already fixes it, so the details never contradict the moves.
+
+    The section notes measure each part of the service on its own, before any move. Once the moves are
+    applied, many of them are fixed already ("covered_by" lists those moves); the rest say how far off
+    they would still be.
+    """
+    if not moves:
+        return notes
+    checks = ref["checks"]
+    setup = ref["setups"][ref["setup"]]
+    targets = {"worship": setup["worship_lufs"], SPEECH_CATEGORY: setup["speech_lufs"]}
+    tol = checks["loudness_tolerance_lu"]
+    num = {m["move"]: i for i, m in enumerate(moves, 1)}
+    by = {m["move"]: m for m in moves}
+    gain = by.get("overall_level", {}).get("db", 0.0)
+    shift = by.get("speech_balance", {}).get("db", 0.0)
+    vshift = by.get("video_balance", {}).get("db", 0.0)
+    names = {s["name"]: s for s in sections}
+    starts = {s["start_s"]: i for i, s in enumerate(sections)}
+    limiter = num.get("limiter") or (num["overall_level"] if "limiter" in by.get("overall_level", {}).get("action", "") else None)
+    is_pastor = lambda s: _category(ref, s["type"]) == SPEECH_CATEGORY and s["type"] != "video"
+
+    def cover(n, *keys):
+        n["covered_by"] = sorted({k if isinstance(k, int) else num[k] for k in keys})
+        n["console"] = _covered_text(moves, n["covered_by"])
+
+    out = []
+    for n in notes:
+        n = dict(n)
+        issue, sec = n["issue"], names.get(n["section"])
+        if issue == "overall_loudness" and "overall_level" in num:
+            cover(n, "overall_level")
+        elif issue == "worship_too_loud" and "overall_level" in num and gain < 0:
+            cover(n, "overall_level")
+        elif issue == "true_peak" and limiter:
+            cover(n, limiter)
+        elif issue == "speech_gap" and ("speech_balance" in num or "video_balance" in num):
+            i = starts.get(n.get("time_s"))
+            pair = sections[i - 1:i + 1] if i else []
+            if pair and all(s["type"] != "video" for s in pair) and "speech_balance" in num:
+                n["covered_by"] = [num["speech_balance"]]
+                n["console"] = (f"Move {num['speech_balance']} above takes care of this: turn the pastor's mic "
+                                f"{'up' if shift > 0 else 'down'} about {abs(shift):.0f} dB for the whole service.")
+            elif pair and "video_balance" in num:
+                n["covered_by"] = [num["video_balance"]]
+                n["console"] = (f"Move {num['video_balance']} above takes care of this: turn the video playback "
+                                f"{'up' if vshift > 0 else 'down'} about {abs(vshift):.0f} dB.")
+        elif issue == "sermon_fade" and "speech_consistency" in num:
+            cover(n, "speech_consistency")
+        elif issue == "loudness" and sec is not None and (gain or shift):
+            cat = _category(ref, sec["type"])
+            used = ["overall_level"] if "overall_level" in num else []
+            if is_pastor(sec) and "speech_balance" in num:
+                used.append("speech_balance")
+            if sec["type"] == "video" and "video_balance" in num:
+                used.append("video_balance")
+            after = (sec["integrated_lufs"] + gain + (shift if is_pastor(sec) else 0.0)
+                     + (vshift if sec["type"] == "video" else 0.0))
+            left = after - targets[cat]
+            if not used:
+                pass
+            elif abs(left) <= tol:
+                cover(n, *used)
+            else:
+                nums = sorted(num[k] for k in used)
+                moves_txt = f"move {nums[0]}" if len(nums) == 1 else "moves " + " and ".join(map(str, nums))
+                louder = left > 0
+                far = f"about {abs(left):.0f} dB {'louder' if louder else 'quieter'} than its target"
+                if cat == "worship" and louder:
+                    n["console"] = (f"Even after {moves_txt}, this part would sit {far}. If some songs run much louder "
+                                    "than others every week, compress the band bus a little more so they sit together.")
+                elif cat == "worship":
+                    n["console"] = (f"Even after {moves_txt}, this part would sit {far}. If it isn't music, mark it as "
+                                    "speech or video in Step 2 (Sections) and run the check again; if it is, check "
+                                    "whether the band was turned down here.")
+                elif sec["type"] == "video":
+                    n["console"] = f"Even after {moves_txt}, the video would sit {far}. " + (VIDEO_DOWN if louder else VIDEO_UP)
+                elif "speech_consistency" in num:
+                    n["console"] = (f"Even after {moves_txt}, this part would sit {far}. The speech compressor in "
+                                    f"move {num['speech_consistency']} is there to even this out.")
+                else:
+                    n["console"] = f"Even after {moves_txt}, this part would sit {far}. " + (SPEECH_DOWN if louder else SPEECH_UP)
+        elif "tone" in num and issue in TONE_ISSUES[by["tone"]["tone"]] and sec is not None \
+                and _category(ref, sec["type"]) == "worship" \
+                and (issue != "tilt" or ("darker" if by["tone"]["tone"] == "dark" else "brighter") in n["message"]):
+            cover(n, "tone")
+        elif issue in WIDTH_ISSUES and issue in num:
+            cover(n, issue)
+        out.append(n)
+    return out
+
+
 def render_markdown(report):
     fmt = lambda v, unit: "n/a" if v is None else f"{v}{unit}"
-    lines = [f"# Broadcast Mix Check: {report['file']}", ""]
-    setup, char = report.get("setup"), report.get("character")
-    if setup or char:
-        lines += [f"Setup: {setup or 'standard'} · Mix character: {char or 'balanced'} · "
-                  f"Whole stream: {fmt(report.get('overall_lufs'), ' LUFS')}", ""]
-    lines += ["## Top fixes", ""]
-    fixes = report.get("top_fixes") or []
-    if not fixes:
-        lines.append("Nothing to fix against the current targets.")
-    for i, f in enumerate(fixes, 1):
-        lines.append(f"{i}. {f['message']}")
-        if f["console"]:
-            lines.append(f"   - Console: {f['console']}")
-    lines += ["", "## Sections", ""]
+    lines = [f"# Broadcast Mix Check: {report['file']}", "",
+             f"Whole stream: {fmt(report.get('overall_lufs'), ' LUFS')} · Mix character: {report.get('character') or 'balanced'}", "",
+             "## What to change", ""]
+    moves = report.get("moves") or []
+    if not moves:
+        lines.append("Nothing to change against the current targets.")
+    for i, m in enumerate(moves, 1):
+        lines += [f"{i}. **{m['title']}:** {m['action']}", f"   - Why: {m['why']}"]
+    lines += ["", "## Details", "",
+              "_These notes measure each part of the service on its own, before the moves above. "
+              "Where a move already fixes a note, it says so._", "", "### Sections", ""]
     for s in report["sections"]:
         lufs = f"{s['integrated_lufs']} LUFS" if s["integrated_lufs"] is not None else "too short to measure"
         origin = "detected" if s.get("source") == "auto" else "marked"
@@ -705,7 +957,7 @@ def render_markdown(report):
             f"- **{s['name']}** ({s['type']}, {origin}, {mmss(s['start_s'])}-{mmss(s['end_s'])}): {lufs}, "
             f"peak {s['true_peak_dbtp']} dBTP{extra}"
         )
-    lines += ["", "## All notes for next Sunday", ""]
+    lines += ["", "### Section by section", ""]
     if not report["section_notes"]:
         lines.append("No issues against the current reference targets.")
     for n in report["section_notes"]:
