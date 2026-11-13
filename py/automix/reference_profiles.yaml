@@ -1,25 +1,63 @@
 # Reference targets for the Broadcast Mix Check.
-# PLACEHOLDER VALUES. Matt's annotated church broadcast recordings should set these.
-# Measurements are compared against these numbers; tolerance_db applies to the spectral balance ratios.
+#
+# Loudness targets, the worship-to-speech gap and the true-peak ceiling come from Matt's
+# rulebook (docs/mix-rulebook.md, Nov 2026). Values marked PLACEHOLDER are first guesses
+# that still need Matt's annotated church recordings to tune them.
 
+# The church's stream setup. "limiter" = a brick-wall limiter at the end of the stream bus.
+setup: standard
+setups:
+  standard:
+    worship_lufs: -16
+    speech_lufs: -20
+    overall_min_lufs: -20    # PLACEHOLDER: below this the whole stream is too quiet (YouTube won't raise it)
+  limiter:
+    worship_lufs: -14
+    speech_lufs: -18
+    overall_min_lufs: -18    # PLACEHOLDER
+
+# Every section type maps to worship or speech targets. Videos use speech targets
+# (they arrive pre-mixed and less dynamic) but keep their own label and console advice.
+section_types:
+  worship: worship
+  sermon: speech
+  announcements: speech
+  panel: speech
+  video: speech
+
+# Mix character: Warm & Dynamic (One True Vine) to Bright & Modern (The Middle).
+# tilt_db_per_oct is the raw spectrum slope (pink noise = 3). crest_db is peak over RMS.
+character: balanced
+characters:
+  warm:     {tilt_db_per_oct: 6.5, crest_db: 15}
+  balanced: {tilt_db_per_oct: 5.5, crest_db: 13}
+  modern:   {tilt_db_per_oct: 4.5, crest_db: 11}
+
+# Spectral balance used for speech sections (low end = 40-150 Hz vs 150-2000 Hz).
 profiles:
+  speech:
+    low_vs_mid_db: -6        # PLACEHOLDER
+    harsh_vs_mid_db: -6      # PLACEHOLDER
+    tolerance_db: 3          # PLACEHOLDER
   worship:
-    integrated_lufs: -18
-    low_vs_mid_db: -4
-    harsh_vs_mid_db: -6
-    tolerance_db: 3
-  sermon:
-    integrated_lufs: -17
-    low_vs_mid_db: -6
-    harsh_vs_mid_db: -6
-    tolerance_db: 3
-  announcements:
-    integrated_lufs: -17
-    low_vs_mid_db: -6
-    harsh_vs_mid_db: -6
-    tolerance_db: 3
+    harsh_vs_mid_db: -6      # PLACEHOLDER
+    tolerance_db: 3          # PLACEHOLDER
 
 checks:
-  loudness_tolerance_lu: 2
-  max_section_jump_db: 3
+  loudness_tolerance_lu: 2           # absolute level, each section vs its target
+  worship_speech_gap_db: 4           # speech sits this far under worship
+  gap_tolerance_db: 1                # tighter than the absolute tolerance: errors on both sides add up
+  gap_window_s: 90                   # compare the end of one section with the first 90 s of the next
+  worship_max_lufs: -14              # worship never louder than this, to keep dynamics
+  max_section_jump_db: 3             # other transitions (speech to speech, worship to worship)
   true_peak_ceiling_dbtp: -1.0
+  sermon_fade_db: 3                  # PLACEHOLDER: speech level drop from the first to the last 3 minutes
+  sermon_fade_window_s: 180
+  sermon_fade_min_length_s: 480      # only check speech sections at least 8 minutes long
+  tilt_tolerance_db_per_oct: 1.0     # PLACEHOLDER: balanced character gives a 4.5-6.5 range
+  low_mid_excess_db: 4.5             # PLACEHOLDER: 125-500 Hz above the fitted tilt line = mud (Crash 3.2, Praise 2.8 pass)
+  crest_tolerance_db: 3              # PLACEHOLDER: flag worship this far below the character's crest
+  mono_loss_db: -4.5                 # PLACEHOLDER: 1-4 kHz level lost when summed to mono (-3 = plain stereo)
+  narrow_side_db: -20                # PLACEHOLDER: side this far under mid (150 Hz-8 kHz) = close to mono
+  wide_low_side_db: -8               # PLACEHOLDER: side vs mid below 100 Hz; above this the low end is too wide
+  min_check_length_s: 60             # tone, space and width checks need at least this much audio
