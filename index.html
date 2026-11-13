@@ -48,6 +48,9 @@
   .note .console span { color:var(--accent); font-weight:600; }
   .ok { color:var(--muted); }
   details summary { cursor:pointer; margin:18px 0 8px; }
+  .glossary { margin-top:18px; }
+  .glossary dt { font-weight:600; font-size:14px; }
+  .glossary dd { margin:0 0 8px; color:var(--muted); font-size:14px; }
   input, select { font:inherit; font-size:14px; padding:5px 8px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); }
   input:disabled { opacity:.55; }
   button { font:inherit; padding:9px 16px; border-radius:999px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; transition:background .15s; }
@@ -99,7 +102,7 @@
   <h1>Broadcast Mix Check</h1>
   <p class="lede">Drop in a Sunday recording and get the sections, measurements and notes for next week. The file is read in your browser and never uploaded.</p>
 
-  <div class="placeholder">Test version. Targets are placeholders until Matt's annotated recordings set them. A full Sunday recording takes a few minutes; the progress line shows how far along it is.</div>
+  <div class="placeholder">Loudness targets come from Matt's rulebook. Some thresholds are still placeholders being tuned on real church recordings, so treat the tone and width notes as a first pass. A full Sunday recording takes a few minutes; the progress line shows how far along it is.</div>
 
   <section class="card">
     <h2>1. Recording</h2>
@@ -113,6 +116,15 @@
     <div id="fileName" class="hint"></div>
     <div id="progress" class="hidden"></div>
     <div id="errorBox"></div>
+  </section>
+
+  <section class="card">
+    <div class="step">Church setup</div>
+    <p><label>Stream bus limiter
+      <select id="setup"><option value="standard">No brick-wall limiter (targets: worship -16, speech -20 LUFS)</option><option value="limiter">Brick-wall limiter (targets: worship -14, speech -18 LUFS)</option></select></label></p>
+    <p><label>Mix character
+      <select id="character"><option value="warm">Warm &amp; dynamic</option><option value="balanced" selected>Balanced</option><option value="modern">Bright &amp; modern</option></select></label></p>
+    <div class="hint">Changing these re-measures the recording you have already loaded.</div>
   </section>
 
   <section id="results" class="card hidden">
@@ -137,6 +149,13 @@
         <div id="transitions"></div>
       </div>
     </details>
+    <dl class="glossary">
+      <dt>Loudness (LUFS)</dt><dd>Perceived level over the section, the number streaming services normalize to.</dd>
+      <dt>Peak (dBTP)</dt><dd>Highest true peak. Above the ceiling means clipping risk on the encoder.</dd>
+      <dt>Tilt (dB per octave)</dt><dd>How fast the level falls from lows to highs (worship only). About 4.5 is bright and modern, about 6.5 warm.</dd>
+      <dt>Crest (dB)</dt><dd>Peaks over the average level (worship only). Higher means more dynamic, with more space; lower means squashed.</dd>
+      <dt>2–5 kHz vs mids (dB)</dt><dd>Upper-mid energy relative to the mids. Higher means harsher or more fatiguing.</dd>
+    </dl>
     <div style="margin-top:14px"><button id="copy" class="primary">Copy report (Markdown)</button> <span id="copied" class="hint"></span></div>
   </section>
 </main>
@@ -145,7 +164,7 @@
 /* ---------- Background worker: loads Python and runs the check, so the page stays responsive ---------- */
 function workerMain() {
   const PYODIDE_VERSION = "0.26.4";
-  const BUILD = "2026-11-13-1";   // bump with each release so browsers fetch fresh engine files
+  const BUILD = "2026-11-13-2";   // bump with each release so browsers fetch fresh engine files
   const PY_FILES = [
     "py/browser_entry.py",
     "py/automix/__init__.py", "py/automix/check.py", "py/automix/sections.py", "py/automix/reference_profiles.yaml",
@@ -199,12 +218,12 @@ function workerMain() {
       }
       if (msg.type === "finish") {
         say("measure", "Finding sections and writing notes");
-        const result = JSON.parse(engine.finish());
+        const result = JSON.parse(engine.finish(msg.setup || null, msg.character || null));
         return postMessage({ type: "ack", result });
       }
       if (msg.type === "relabel") {
         // Re-measures with the sections the user set, using the summaries kept from the first pass.
-        const result = JSON.parse(engine.relabel(msg.spec));
+        const result = JSON.parse(engine.relabel(msg.spec, msg.setup || null, msg.character || null));
         return postMessage({ type: "ack", result });
       }
     } catch (err) {
@@ -473,9 +492,12 @@ function renderEditor() {
         <select class="type" data-i="${i}" aria-label="Section type">
           <option value="worship"${s.type === "worship" ? " selected" : ""}>Worship</option>
           <option value="sermon"${s.type === "sermon" ? " selected" : ""}>Sermon</option>
+          <option value="announcements"${s.type === "announcements" ? " selected" : ""}>Announcements</option>
+          <option value="panel"${s.type === "panel" ? " selected" : ""}>Panel</option>
+          <option value="video"${s.type === "video" ? " selected" : ""}>Video</option>
         </select>
         <span class="src">${esc(s.source)}</span>
-        <span class="metrics">${fmt(m.integrated_lufs)} LUFS · peak ${fmt(m.true_peak_dbtp)} dBTP · low vs mid ${fmt(m.low_vs_mid_db)} dB · 2-5 kHz vs mid ${fmt(m.harsh_vs_mid_db)} dB</span>
+        <span class="metrics">${fmt(m.integrated_lufs)} LUFS · peak ${fmt(m.true_peak_dbtp)} dBTP${s.type === "worship" ? ` · tilt ${fmt(m.tilt_db_per_oct)} dB/oct · crest ${fmt(m.crest_db)} dB` : ""} · 2-5 kHz vs mid ${fmt(m.harsh_vs_mid_db)} dB</span>
       </div>
       <div class="sec-times" style="margin-top:10px">
         <label>Start <input class="start" data-i="${i}" value="${mmss(s.start)}" ${i === 0 ? "disabled" : ""}></label>
@@ -564,7 +586,7 @@ async function runRelabel() {
   setBusy("Re-measuring with your changes…");
   try {
     const spec = model.sections.map((s) => ({ name: s.name, type: s.type, start_s: s.start, end_s: s.end, source: "manual" }));
-    const reply = await ask({ type: "relabel", spec: JSON.stringify(spec) });
+    const reply = await ask({ type: "relabel", spec: JSON.stringify(spec), setup: $("setup").value, character: $("character").value });
     applyReport(reply.result.report, false);
     setBusy("Updated.");
   } catch (err) {
@@ -794,7 +816,7 @@ async function measure(src) {
       : `Measured all ${mmss(seconds)} of audio`);
   }
   setStep("measure", "active", "Finding sections and writing notes");
-  const reply = await ask({ type: "finish" });
+  const reply = await ask({ type: "finish", setup: $("setup").value, character: $("character").value });
   if (ticker) { clearInterval(ticker); ticker = null; }
   setStep("measure", "done", "Finished");
   // The waveform and editor appear only once measuring has finished.
@@ -857,6 +879,7 @@ async function analyze(file) {
 const drop = $("drop");
 drop.addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", (e) => e.target.files[0] && analyze(e.target.files[0]));
+["setup", "character"].forEach((id) => $(id).addEventListener("change", () => { if (model) scheduleRelabel(); }));
 drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
 drop.addEventListener("dragleave", () => drop.classList.remove("over"));
 drop.addEventListener("drop", (e) => {
@@ -878,7 +901,7 @@ function buildMarkdown() {
     const lufs = m.integrated_lufs != null ? `${m.integrated_lufs} LUFS` : "too short to measure";
     lines.push(
       `- **${s.name}** (${s.type}, ${s.source}, ${s.start.toFixed(1)}-${s.end.toFixed(1)} s): ${lufs}, ` +
-      `peak ${fmt(m.true_peak_dbtp)} dBTP, low vs mid ${fmt(m.low_vs_mid_db)} dB, 2-5 kHz vs mid ${fmt(m.harsh_vs_mid_db)} dB`
+      `peak ${fmt(m.true_peak_dbtp)} dBTP${s.type === "worship" ? `, tilt ${fmt(m.tilt_db_per_oct)} dB/oct, crest ${fmt(m.crest_db)} dB` : ""}, 2-5 kHz vs mid ${fmt(m.harsh_vs_mid_db)} dB`
     );
   }
   lines.push("", "## Notes for next Sunday", "");
